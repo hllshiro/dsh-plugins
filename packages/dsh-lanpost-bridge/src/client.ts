@@ -41,8 +41,11 @@ export interface SessionEntry {
 /** GET /status 归一化后的形状：连接状态 + 游标 + 会话映射。 */
 export interface BridgeStatus {
   state: BridgeStateName
-  /** 会话映射；POST /reconnect 的响应不带它，故缺省而不是空对象。 */
-  sessions?: Record<string, SessionEntry>
+  /**
+   * 会话映射；`null` 表示「未知」（如刚重连、还没拉过 /status），缺省表示响应未携带。
+   * 二者都不能当成空表渲染。
+   */
+  sessions?: Record<string, SessionEntry> | null
   since?: number
   error?: string
   /** 需要告知上层但不算失败的提示（如令牌已轮换、连接数超限、游标重置）。 */
@@ -65,6 +68,17 @@ export class BridgeHttpError extends Error {
     super(message)
     this.name = 'BridgeHttpError'
     this.status = status
+  }
+}
+
+/** 宿主路由在时限内没有响应；文案直接面向设置页，避免只抛一个 AbortError。 */
+export class BridgeTimeoutError extends Error {
+  readonly timeoutMs: number
+
+  constructor(timeoutMs: number) {
+    super(`请求超时：宿主在 ${Math.round(timeoutMs / 1000)} 秒内没有响应`)
+    this.name = 'BridgeTimeoutError'
+    this.timeoutMs = timeoutMs
   }
 }
 
@@ -132,9 +146,13 @@ export function normalizeStatus(raw: unknown): BridgeStatus {
 /**
  * 把只有引擎字段的响应（POST /reconnect）合并到现有状态：会话映射与公开设置不属于引擎状态，
  * 必须从旧状态保留，否则重连一次映射表就被清空。引擎缺省的 error/notice 视为已清除。
+ * 没有旧状态可合并、或两边都没有映射表时，把 `sessions` 标成 `null`（未知）而不是留空，
+ * 否则 UI 会把「还没拉过映射表」误当成「确实没有映射」。
  */
 export function mergeEngineStatus(previous: BridgeStatus | null, engine: BridgeStatus): BridgeStatus {
-  if (previous === null) return engine
+  if (previous === null) {
+    return engine.sessions === undefined ? { ...engine, sessions: null } : engine
+  }
   const next: BridgeStatus = { state: engine.state }
   if (engine.since !== undefined) next.since = engine.since
   if (engine.error !== undefined) next.error = engine.error
@@ -142,6 +160,7 @@ export function mergeEngineStatus(previous: BridgeStatus | null, engine: BridgeS
   if (engine.lastSequence !== undefined) next.lastSequence = engine.lastSequence
   if (engine.sessions !== undefined) next.sessions = engine.sessions
   else if (previous.sessions !== undefined) next.sessions = previous.sessions
+  else next.sessions = null
   if (engine.settings !== undefined) next.settings = engine.settings
   else if (previous.settings !== undefined) next.settings = previous.settings
   return next
@@ -165,15 +184,28 @@ export function normalizeWorkspaces(raw: unknown): WorkspaceEntry[] {
   return entries
 }
 
+/** 单个 loopback 请求的时限；超时后中断 fetch，避免 busy 状态永远解不开。 */
+const REQUEST_TIMEOUT_MS = 15_000
+
 async function requestJson(path: string, init?: RequestInit): Promise<unknown> {
-  const response = await fetch(`${API_BASE}${path}`, init)
-  const payload: unknown = await response.json().catch(() => null)
-  if (!response.ok) {
-    const message =
-      isRecord(payload) && typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`
-    throw new BridgeHttpError(response.status, message)
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  try {
+    const response = await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal })
+    const payload: unknown = await response.json().catch(() => null)
+    if (!response.ok) {
+      const message =
+        isRecord(payload) && typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`
+      throw new BridgeHttpError(response.status, message)
+    }
+    return payload
+  } catch (error) {
+    // 只有本函数自己的超时中断才改写成可读错误；其余网络异常原样上抛。
+    if (controller.signal.aborted) throw new BridgeTimeoutError(REQUEST_TIMEOUT_MS)
+    throw error
+  } finally {
+    clearTimeout(timer)
   }
-  return payload
 }
 
 /** 读取公开设置（令牌不会出现在响应里）。 */
@@ -280,13 +312,16 @@ export function toPatch(form: SettingsForm): SettingsPatch {
 /**
  * 保存成功文案：宿主只在 enabled / gatewayUrl / token 变化时重建网关（src/index.ts），
  * 其余设置保存即生效。文案必须与宿主行为一致，不能一律说「已重连」。
+ * 客户端拿不到已存令牌（只有 tokenSet），所以只能按「输入了新令牌」给出弱化提示，
+ * 不能断言宿主一定会重连（重输相同令牌时宿主按值比较不会重启）。
  */
 export function saveSuccessText(previous: SettingsForm, next: SettingsForm): string {
   const restarts =
     previous.enabled !== next.enabled ||
-    previous.gatewayUrl.trim() !== next.gatewayUrl.trim() ||
-    next.token.trim() !== ''
-  return restarts ? '已保存，网关已按新配置重连。' : '已保存。'
+    previous.gatewayUrl.trim() !== next.gatewayUrl.trim()
+  if (restarts) return '已保存，网关已按新配置重连。'
+  if (next.token.trim() !== '') return '已保存（令牌有变更时会重新连接）。'
+  return '已保存。'
 }
 
 const STATUS_TEXT: Record<BridgeStateName, string> = {
@@ -329,6 +364,7 @@ const ERROR_TEXT: Record<string, string> = {
 
 /** 任意异常 → 页面可读的错误文案。 */
 export function formatError(error: unknown): string {
+  if (error instanceof BridgeTimeoutError) return error.message
   if (error instanceof BridgeHttpError) {
     return ERROR_TEXT[error.message] ?? `请求失败（${error.status}）：${error.message}`
   }
@@ -398,6 +434,28 @@ const styles: Record<string, React.CSSProperties> = {
     color: C.success,
     borderRadius: 8,
     padding: '10px 12px',
+    fontSize: 13,
+    overflowWrap: 'anywhere',
+  },
+  // 操作部分成功（如保存成功但状态刷新失败）：既不能说成功（绿），也不该报成失败（红）。
+  warnBox: {
+    border: `1px solid ${C.warnBorder}`,
+    background: C.warnBg,
+    color: C.warn,
+    borderRadius: 8,
+    padding: '10px 12px',
+    fontSize: 13,
+    overflowWrap: 'anywhere',
+  },
+  statusError: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+    border: `1px solid ${C.dangerBorder}`,
+    background: C.dangerBg,
+    color: C.danger,
+    borderRadius: 8,
+    padding: '8px 10px',
     fontSize: 13,
     overflowWrap: 'anywhere',
   },
@@ -597,6 +655,20 @@ function StatusLine(props: { label: string; value: string }): React.ReactElement
   )
 }
 
+/** 状态区显著横幅：error 用 danger 色，notice 用 warn 色，两者可以同时出现。 */
+function StatusBanner(props: {
+  label: string
+  text: string
+  tone: 'danger' | 'warn'
+}): React.ReactElement {
+  return h(
+    'div',
+    { style: props.tone === 'danger' ? styles.statusError : styles.statusNotice },
+    h('span', { style: styles.statusNoticeLabel }, props.label),
+    h('span', null, props.text),
+  )
+}
+
 function formsEqual(a: SettingsForm, b: SettingsForm): boolean {
   return (
     a.enabled === b.enabled &&
@@ -619,6 +691,7 @@ function Section(): React.ReactElement {
   const [workspaces, setWorkspaces] = React.useState<WorkspaceEntry[]>([])
   const [error, setError] = React.useState<string | null>(null)
   const [notice, setNotice] = React.useState<string | null>(null)
+  const [warning, setWarning] = React.useState<string | null>(null)
   const [loadError, setLoadError] = React.useState<string | null>(null)
   const [workspaceError, setWorkspaceError] = React.useState<string | null>(null)
   const [statusError, setStatusError] = React.useState<string | null>(null)
@@ -672,6 +745,7 @@ function Section(): React.ReactElement {
     setBusy('save')
     setError(null)
     setNotice(null)
+    setWarning(null)
     try {
       const next = await patchSettings(toPatch(nextFormToSend))
       const nextForm = toForm(next)
@@ -684,7 +758,9 @@ function Section(): React.ReactElement {
         setStatus(await fetchStatus())
         setStatusError(null)
       } catch (reason) {
-        setNotice(`已保存，但状态刷新失败：${formatError(reason)}`)
+        // 旧的 statusError 属于上一次刷新，清掉以免和本次提示重复；本次失败用 warn 色框说明。
+        setStatusError(null)
+        setWarning(`已保存，但状态刷新失败：${formatError(reason)}`)
       }
     } catch (reason) {
       setError(formatError(reason))
@@ -697,6 +773,7 @@ function Section(): React.ReactElement {
     setBusy('refresh')
     setError(null)
     setNotice(null)
+    setWarning(null)
     try {
       setStatus(await fetchStatus())
       setStatusError(null)
@@ -711,6 +788,7 @@ function Section(): React.ReactElement {
     setBusy('reconnect')
     setError(null)
     setNotice(null)
+    setWarning(null)
     try {
       const result = await reconnect()
       // 重连响应只有引擎状态：合并而不是整包覆盖，否则会话映射表会被清空。
@@ -728,11 +806,14 @@ function Section(): React.ReactElement {
     setBusy(`session:${key}`)
     setError(null)
     setNotice(null)
+    setWarning(null)
     try {
       const result = await deleteSession(key)
       if (result.removed) {
         setStatus((previous) => {
-          if (previous === null || previous.sessions === undefined) return previous
+          if (previous === null || previous.sessions === undefined || previous.sessions === null) {
+            return previous
+          }
           const sessions = { ...previous.sessions }
           delete sessions[key]
           return { ...previous, sessions }
@@ -747,8 +828,10 @@ function Section(): React.ReactElement {
   }
 
   const dirty = form !== null && saved !== null && !formsEqual(form, saved)
-  const sessionEntries: Array<[string, SessionEntry]> =
-    status === null || status.sessions === undefined ? [] : Object.entries(status.sessions)
+  // sessions 为 null/缺省表示「映射表未知」（如刚重连、还没拉过状态），不能渲染成「暂无映射」。
+  const sessions = status?.sessions ?? null
+  const sessionsUnknown = sessions === null
+  const sessionEntries: Array<[string, SessionEntry]> = sessions === null ? [] : Object.entries(sessions)
   const disabled = busy !== null
   const savedEnabled = saved?.enabled ?? status?.settings?.enabled
   const enabledPending = dirty && form !== null && saved !== null && form.enabled !== saved.enabled
@@ -769,6 +852,7 @@ function Section(): React.ReactElement {
       h('span', null, '私聊对所有联系人放行：任何能私聊到本机的人都可以驱动本机 agent。'),
     ),
     error === null ? null : h('div', { style: styles.errorBox }, error),
+    warning === null ? null : h('div', { style: styles.warnBox }, warning),
     notice === null ? null : h('div', { style: styles.noticeBox }, notice),
     form === null
       ? h(
@@ -958,14 +1042,12 @@ function Section(): React.ReactElement {
         h('span', { style: styles.statusTitle }, '连接状态'),
         h(Pill, { text: formatStatus(status), tone: statusTone(status?.state) }),
       ),
-      status?.notice === undefined
+      status === null || status.error === undefined
         ? null
-        : h(
-            'div',
-            { style: styles.statusNotice },
-            h('span', { style: styles.statusNoticeLabel }, '网关提示'),
-            h('span', null, status.notice),
-          ),
+        : h(StatusBanner, { label: '网关错误', text: status.error, tone: 'danger' }),
+      status === null || status.notice === undefined
+        ? null
+        : h(StatusBanner, { label: '网关提示', text: status.notice, tone: 'warn' }),
       statusError === null ? null : h('p', { style: styles.hint }, `状态读取失败：${statusError}`),
       h(
         'div',
@@ -975,7 +1057,7 @@ function Section(): React.ReactElement {
           label: '游标（lastSequence）',
           value: status?.lastSequence === undefined ? '—' : String(status.lastSequence),
         }),
-        h(StatusLine, { label: '会话数', value: String(sessionEntries.length) }),
+        h(StatusLine, { label: '会话数', value: sessionsUnknown ? '—' : String(sessionEntries.length) }),
         h(StatusLine, {
           label: '启用状态',
           value: enabledPending ? `${enabledText}（有未保存的修改）` : enabledText,
@@ -994,10 +1076,14 @@ function Section(): React.ReactElement {
       h(
         'div',
         { style: styles.statusHeader },
-        h('span', { style: styles.statusTitle }, `会话映射（${sessionEntries.length}）`),
+        h('span', { style: styles.statusTitle }, `会话映射（${sessionsUnknown ? '未知' : sessionEntries.length}）`),
       ),
       sessionEntries.length === 0
-        ? h('p', { style: styles.hint }, '暂无映射。收到并处理消息后会自动建立。')
+        ? h(
+            'p',
+            { style: styles.hint },
+            sessionsUnknown ? '映射表未知，请刷新状态。' : '暂无映射。收到并处理消息后会自动建立。',
+          )
         : h(
             'div',
             { style: styles.table },

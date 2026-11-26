@@ -81,6 +81,7 @@ test('fetchSettings：GET /settings 并解包 settings 字段', async (t) => {
   assert.equal(recorded.length, 1)
   assert.equal(recorded[0].url, '/api/lanpost-bridge/settings')
   assert.equal(recorded[0].init?.method ?? 'GET', 'GET')
+  assert.ok(recorded[0].init?.signal instanceof AbortSignal, '每个请求都必须带超时中断信号')
   assert.deepEqual(settings, SAMPLE_SETTINGS)
   assert.equal('token' in settings, false, '公开设置不得回显令牌')
 })
@@ -147,13 +148,13 @@ test('reconnect：POST /reconnect 并解包 ok/status（响应只有引擎字段
   assert.equal('sessions' in result.status, false, '重连响应不含映射表，必须靠 mergeEngineStatus 合并')
 })
 
-test('fetchStatus：读取 GET /status 的真实裸形状，notice 必须进入状态模型', async (t) => {
+test('fetchStatus：游标重置只产生 notice，映射表过滤与 settings 归一化照旧', async (t) => {
+  const notice = '事件游标不连续（EVENT_CURSOR_EXPIRED），已重置为 0 并在本次连接重新 resume；可能缺历史事件'
   const recorded = installFetch(t, () => ({
     body: {
-      state: 'error',
+      state: 'connected',
       since: 99,
-      error: '令牌已轮换，请更新令牌',
-      notice: '令牌已轮换，请更新令牌',
+      notice,
       lastSequence: 7,
       sessions: {
         'private:u1': { sessionId: 's1', updatedAt: '2026-11-26T00:00:00.000Z' },
@@ -167,15 +168,41 @@ test('fetchStatus：读取 GET /status 的真实裸形状，notice 必须进入�
 
   assert.equal(recorded[0].url, '/api/lanpost-bridge/status')
   assert.deepEqual(status, {
-    state: 'error',
+    state: 'connected',
     since: 99,
-    error: '令牌已轮换，请更新令牌',
-    notice: '令牌已轮换，请更新令牌',
+    notice,
     lastSequence: 7,
     sessions: { 'private:u1': { sessionId: 's1', updatedAt: '2026-11-26T00:00:00.000Z' } },
     settings: SAMPLE_SETTINGS,
   })
-  assert.equal(status.notice, '令牌已轮换，请更新令牌')
+  assert.equal('error' in status, false, 'notice 不是 error，二者不得互相冒充')
+})
+
+test('fetchStatus：4401 令牌轮换只进入 error，不伪造 notice', async (t) => {
+  installFetch(t, () => ({
+    body: { state: 'error', since: 99, error: '令牌已轮换，请更新令牌', lastSequence: 7 },
+  }))
+  const status = await client.fetchStatus()
+
+  assert.deepEqual(status, {
+    state: 'error',
+    since: 99,
+    error: '令牌已轮换，请更新令牌',
+    lastSequence: 7,
+  })
+  assert.equal('notice' in status, false, 'error 不得同时落进 notice')
+})
+
+test('fetchStatus：error 与 notice 可并存，状态模型两者都保留', async (t) => {
+  const notice = '事件游标不连续（EVENT_CURSOR_EXPIRED），已重置为 0 并在本次连接重新 resume；可能缺历史事件'
+  installFetch(t, () => ({
+    body: { state: 'error', since: 5, error: '连接数超限', notice, lastSequence: 12 },
+  }))
+  const status = await client.fetchStatus()
+
+  assert.equal(status.error, '连接数超限')
+  assert.equal(status.notice, notice)
+  assert.deepEqual(status, { state: 'error', since: 5, error: '连接数超限', notice, lastSequence: 12 })
 })
 
 test('fetchStatus：可选字段缺省时不产生键，未知状态回落 idle', async (t) => {
@@ -212,7 +239,17 @@ test('mergeEngineStatus：替换引擎字段，保住旧映射表与设置', () 
   assert.equal('error' in merged, false, '引擎缺省 error 视为已清除')
   assert.equal('notice' in merged, false, '引擎缺省 notice 视为已清除')
 
-  assert.deepEqual(client.mergeEngineStatus(null, { state: 'idle' }), { state: 'idle' })
+  assert.deepEqual(client.mergeEngineStatus(null, { state: 'idle' }), { state: 'idle', sessions: null })
+  // 重连响应没有映射表：必须标成「未知」（null），不能留空让 UI 误报「暂无映射」。
+  assert.deepEqual(client.mergeEngineStatus(null, { state: 'connected', since: 2 }), {
+    state: 'connected',
+    since: 2,
+    sessions: null,
+  })
+  assert.deepEqual(client.mergeEngineStatus({ state: 'connected', sessions: null }, { state: 'error' }), {
+    state: 'error',
+    sessions: null,
+  })
 
   const replaced = client.mergeEngineStatus(previous, {
     state: 'connected',
@@ -317,7 +354,7 @@ test('toPatch：去空白并保留非空令牌', () => {
   })
 })
 
-test('saveSuccessText：只有 enabled/gatewayUrl/token 变化才说已重连', () => {
+test('saveSuccessText：enabled/gatewayUrl 变更才断言已重连，令牌只做弱化提示', () => {
   const saved = client.toForm(SAMPLE_SETTINGS)
   assert.equal(client.saveSuccessText(saved, saved), '已保存。')
   assert.equal(
@@ -329,7 +366,16 @@ test('saveSuccessText：只有 enabled/gatewayUrl/token 变化才说已重连', 
     client.saveSuccessText(saved, { ...saved, gatewayUrl: '  wss://10.0.0.1:8443/ws/dsh  ' }),
     '已保存，网关已按新配置重连。',
   )
-  assert.equal(client.saveSuccessText(saved, { ...saved, token: ' tok-2 ' }), '已保存，网关已按新配置重连。')
+  // 只差首尾空白：trim 后相同，宿主不会重建网关。
+  assert.equal(
+    client.saveSuccessText(saved, { ...saved, gatewayUrl: `  ${saved.gatewayUrl}  ` }),
+    '已保存。',
+  )
+  // 客户端只有 tokenSet、拿不到已存令牌，不能断言重输相同令牌一定会重连。
+  assert.equal(
+    client.saveSuccessText(saved, { ...saved, token: ' tok-2 ' }),
+    '已保存（令牌有变更时会重新连接）。',
+  )
   assert.equal(client.saveSuccessText(saved, { ...saved, token: '   ' }), '已保存。')
 })
 
@@ -398,6 +444,10 @@ test('formatError：已知错误码翻成中文，其余原样呈现', () => {
     '请求失败（418）：teapot',
   )
   assert.equal(client.formatError(new Error('boom')), 'boom')
+  assert.equal(
+    client.formatError(new client.BridgeTimeoutError(15000)),
+    '请求超时：宿主在 15 秒内没有响应',
+  )
   assert.equal(client.formatError('raw'), 'raw')
   assert.equal(client.formatError(null), '未知错误')
 })
