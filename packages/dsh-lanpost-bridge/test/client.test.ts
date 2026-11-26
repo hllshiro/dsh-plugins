@@ -3,6 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { TestContext } from 'node:test'
+import type { BridgeStatus } from '../src/client.ts'
 
 const importCalls: string[] = []
 const realFetch = globalThis.fetch
@@ -133,52 +134,93 @@ test('patchSettings：PATCH JSON 并向回解包 settings', async (t) => {
   assert.equal(result.sessionMode, 'new')
 })
 
-test('reconnect：POST /reconnect 并解包 ok/status', async (t) => {
+test('reconnect：POST /reconnect 并解包 ok/status（响应只有引擎字段）', async (t) => {
   const recorded = installFetch(t, () => ({
-    body: { ok: true, status: { state: 'connected', since: 123, sessions: {} } },
+    body: { ok: true, status: { state: 'connected', since: 123, lastSequence: 9 } },
   }))
   const result = await client.reconnect()
 
   assert.equal(recorded[0].url, '/api/lanpost-bridge/reconnect')
   assert.equal(recorded[0].init?.method, 'POST')
   assert.equal(result.ok, true)
-  assert.equal(result.status.state, 'connected')
-  assert.equal(result.status.since, 123)
+  assert.deepEqual(result.status, { state: 'connected', since: 123, lastSequence: 9 })
+  assert.equal('sessions' in result.status, false, '重连响应不含映射表，必须靠 mergeEngineStatus 合并')
 })
 
-test('fetchStatus：解包 status，兼容 state/connection 与坏掉的会话项', async (t) => {
+test('fetchStatus：读取 GET /status 的真实裸形状，notice 必须进入状态模型', async (t) => {
   const recorded = installFetch(t, () => ({
     body: {
-      status: {
-        state: 'connected',
-        since: 99,
-        error: '上游断开',
-        lastSequence: 7,
-        sessions: {
-          'private:u1': { sessionId: 's1', updatedAt: '2026-11-26T00:00:00.000Z' },
-          broken: { sessionId: 5 },
-          alsoBroken: null,
-        },
+      state: 'error',
+      since: 99,
+      error: '令牌已轮换，请更新令牌',
+      notice: '令牌已轮换，请更新令牌',
+      lastSequence: 7,
+      sessions: {
+        'private:u1': { sessionId: 's1', updatedAt: '2026-11-26T00:00:00.000Z' },
+        broken: { sessionId: 5 },
+        alsoBroken: null,
       },
+      settings: SAMPLE_SETTINGS,
     },
   }))
   const status = await client.fetchStatus()
 
   assert.equal(recorded[0].url, '/api/lanpost-bridge/status')
   assert.deepEqual(status, {
-    state: 'connected',
-    sessions: { 'private:u1': { sessionId: 's1', updatedAt: '2026-11-26T00:00:00.000Z' } },
-    since: 99,
-    error: '上游断开',
-    lastSequence: 7,
-  })
-
-  installFetch(t, () => ({ body: { connection: 'error', error: 'boom' } }))
-  assert.deepEqual(await client.fetchStatus(), {
     state: 'error',
-    sessions: {},
-    error: 'boom',
+    since: 99,
+    error: '令牌已轮换，请更新令牌',
+    notice: '令牌已轮换，请更新令牌',
+    lastSequence: 7,
+    sessions: { 'private:u1': { sessionId: 's1', updatedAt: '2026-11-26T00:00:00.000Z' } },
+    settings: SAMPLE_SETTINGS,
   })
+  assert.equal(status.notice, '令牌已轮换，请更新令牌')
+})
+
+test('fetchStatus：可选字段缺省时不产生键，未知状态回落 idle', async (t) => {
+  installFetch(t, () => ({ body: { state: 'connected', since: 1, lastSequence: 3 } }))
+  const status = await client.fetchStatus()
+  assert.deepEqual(status, { state: 'connected', since: 1, lastSequence: 3 })
+  assert.equal('error' in status, false)
+  assert.equal('notice' in status, false)
+  assert.equal('sessions' in status, false)
+  assert.equal('settings' in status, false)
+
+  installFetch(t, () => ({ body: { state: 'weird' } }))
+  assert.deepEqual(await client.fetchStatus(), { state: 'idle' })
+})
+
+test('mergeEngineStatus：替换引擎字段，保住旧映射表与设置', () => {
+  const previous: BridgeStatus = {
+    state: 'error',
+    since: 1,
+    error: '令牌已轮换，请更新令牌',
+    notice: '令牌已轮换，请更新令牌',
+    lastSequence: 5,
+    sessions: { 'private:u1': { sessionId: 's1', updatedAt: 't1' } },
+    settings: SAMPLE_SETTINGS,
+  }
+  const merged = client.mergeEngineStatus(previous, { state: 'connected', since: 2, lastSequence: 6 })
+  assert.deepEqual(merged, {
+    state: 'connected',
+    since: 2,
+    lastSequence: 6,
+    sessions: { 'private:u1': { sessionId: 's1', updatedAt: 't1' } },
+    settings: SAMPLE_SETTINGS,
+  })
+  assert.equal('error' in merged, false, '引擎缺省 error 视为已清除')
+  assert.equal('notice' in merged, false, '引擎缺省 notice 视为已清除')
+
+  assert.deepEqual(client.mergeEngineStatus(null, { state: 'idle' }), { state: 'idle' })
+
+  const replaced = client.mergeEngineStatus(previous, {
+    state: 'connected',
+    sessions: {},
+    settings: { ...SAMPLE_SETTINGS, enabled: false },
+  })
+  assert.deepEqual(replaced.sessions, {})
+  assert.equal(replaced.settings?.enabled, false)
 })
 
 test('fetchWorkspaces：解包 workspaces 并筛掉形状不对的项', async (t) => {
@@ -201,17 +243,23 @@ test('fetchWorkspaces：解包 workspaces 并筛掉形状不对的项', async (t
     { id: 'b', path: '/b' },
   ])
 
-  installFetch(t, () => ({ body: [] }))
+  installFetch(t, () => ({ body: {} }))
   assert.deepEqual(await client.fetchWorkspaces(), [])
 })
 
-test('deleteSession：DELETE /sessions/:key 且正确编码键', async (t) => {
+test('deleteSession：DELETE /sessions/:key 且回传宿主是否真的删掉', async (t) => {
   const key = 'private:u 1/2?x'
   const recorded = installFetch(t, () => ({ body: { ok: true, removed: true } }))
-  await client.deleteSession(key)
+  assert.deepEqual(await client.deleteSession(key), { removed: true })
 
   assert.equal(recorded[0].url, `/api/lanpost-bridge/sessions/${encodeURIComponent(key)}`)
   assert.equal(recorded[0].init?.method, 'DELETE')
+
+  installFetch(t, () => ({ body: { ok: true, removed: false } }))
+  assert.deepEqual(await client.deleteSession(key), { removed: false })
+
+  installFetch(t, () => ({ body: null }))
+  assert.deepEqual(await client.deleteSession(key), { removed: false })
 })
 
 test('toForm：公开设置转表单，令牌永远留空', () => {
@@ -267,6 +315,61 @@ test('toPatch：去空白并保留非空令牌', () => {
     selfProtocolId: 'me',
     token: 'tok-1',
   })
+})
+
+test('saveSuccessText：只有 enabled/gatewayUrl/token 变化才说已重连', () => {
+  const saved = client.toForm(SAMPLE_SETTINGS)
+  assert.equal(client.saveSuccessText(saved, saved), '已保存。')
+  assert.equal(
+    client.saveSuccessText(saved, { ...saved, showProcess: !saved.showProcess, workspacePath: '/other' }),
+    '已保存。',
+  )
+  assert.equal(client.saveSuccessText(saved, { ...saved, enabled: !saved.enabled }), '已保存，网关已按新配置重连。')
+  assert.equal(
+    client.saveSuccessText(saved, { ...saved, gatewayUrl: '  wss://10.0.0.1:8443/ws/dsh  ' }),
+    '已保存，网关已按新配置重连。',
+  )
+  assert.equal(client.saveSuccessText(saved, { ...saved, token: ' tok-2 ' }), '已保存，网关已按新配置重连。')
+  assert.equal(client.saveSuccessText(saved, { ...saved, token: '   ' }), '已保存。')
+})
+
+test('apply：直接经 slots.inject 注册 settings.section，由 slot 自身记账', () => {
+  const event: string[] = []
+  const registrations: Array<Record<string, unknown>> = []
+  let contribute: () => void = () => {
+    throw new Error('slots.inject 未被调用')
+  }
+  const ctx = {
+    slots: {
+      inject(name: string, next: () => void) {
+        event.push(`inject:${name}`)
+        contribute = next
+        return () => {
+          event.push('inject:dispose')
+        }
+      },
+      register(next: Record<string, unknown>) {
+        registrations.push(next)
+        event.push('register')
+        return () => {
+          event.push('register:dispose')
+        }
+      },
+    },
+  }
+
+  client.apply(ctx)
+
+  assert.deepEqual(event, ['inject:settings.section'])
+  assert.equal(registrations.length, 0, '贡献函数被调用前不应注册')
+  contribute()
+  assert.deepEqual(event, ['inject:settings.section', 'register'])
+  assert.equal(registrations.length, 1)
+  const options = registrations[0]
+  assert.equal(options.name, 'settings.section')
+  assert.equal(options.id, 'lanpost-bridge')
+  assert.equal(options.order, 120)
+  assert.equal(typeof options.label, 'function')
 })
 
 test('formatStatus / statusTone：连接状态文案与色调', () => {

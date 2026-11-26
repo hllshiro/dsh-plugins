@@ -41,9 +41,12 @@ export interface SessionEntry {
 /** GET /status 归一化后的形状：连接状态 + 游标 + 会话映射。 */
 export interface BridgeStatus {
   state: BridgeStateName
-  sessions: Record<string, SessionEntry>
+  /** 会话映射；POST /reconnect 的响应不带它，故缺省而不是空对象。 */
+  sessions?: Record<string, SessionEntry>
   since?: number
   error?: string
+  /** 需要告知上层但不算失败的提示（如令牌已轮换、连接数超限、游标重置）。 */
+  notice?: string
   lastSequence?: number
   settings?: PublicSettings
 }
@@ -90,8 +93,8 @@ function normalizeSessions(raw: unknown): Record<string, SessionEntry> {
 }
 
 /**
- * 公开设置归一化：同时接受 `{ settings: ... }` 与裸对象（宿主历史上两种都出现过），
- * 并为字段缺失补默认值，避免设置页因半截响应崩溃。
+ * 公开设置归一化：为字段缺失补默认值，避免设置页因半截响应崩溃。
+ * 同时接受 `{ settings: ... }` 与裸对象（防御性：GET /status 里已解包的就是裸 settings）。
  */
 export function normalizeSettings(raw: unknown): PublicSettings {
   const outer = isRecord(raw) ? raw : {}
@@ -111,27 +114,43 @@ export function normalizeSettings(raw: unknown): PublicSettings {
 }
 
 /**
- * 状态归一化：接受 `{ status: ... }` 与裸对象，连接状态兼容 `state` / `connection` 两种键，
- * 会话映射里形状不对的项直接丢弃而不是让整页报错。
+ * 状态归一化：只接受 GET /status 的裸对象。会话映射里形状不对的项直接丢弃而不是让整页报错；
+ * 可选字段缺省时保持缺省——POST /reconnect 只回引擎状态，靠 mergeEngineStatus 保住映射表。
  */
 export function normalizeStatus(raw: unknown): BridgeStatus {
-  const outer = isRecord(raw) ? raw : {}
-  const source = isRecord(outer.status) ? outer.status : outer
-  const status: BridgeStatus = {
-    state: asStateName(source.state) ?? asStateName(source.connection) ?? 'idle',
-    sessions: normalizeSessions(source.sessions),
-  }
+  const source = isRecord(raw) ? raw : {}
+  const status: BridgeStatus = { state: asStateName(source.state) ?? 'idle' }
+  if (source.sessions !== undefined) status.sessions = normalizeSessions(source.sessions)
   if (typeof source.since === 'number') status.since = source.since
   if (typeof source.error === 'string' && source.error !== '') status.error = source.error
+  if (typeof source.notice === 'string' && source.notice !== '') status.notice = source.notice
   if (typeof source.lastSequence === 'number') status.lastSequence = source.lastSequence
   if (isRecord(source.settings)) status.settings = normalizeSettings(source.settings)
   return status
 }
 
-/** 工作区列表归一化：接受 `{ workspaces: [...] }` 与裸数组，丢弃缺 id/path 的项。 */
+/**
+ * 把只有引擎字段的响应（POST /reconnect）合并到现有状态：会话映射与公开设置不属于引擎状态，
+ * 必须从旧状态保留，否则重连一次映射表就被清空。引擎缺省的 error/notice 视为已清除。
+ */
+export function mergeEngineStatus(previous: BridgeStatus | null, engine: BridgeStatus): BridgeStatus {
+  if (previous === null) return engine
+  const next: BridgeStatus = { state: engine.state }
+  if (engine.since !== undefined) next.since = engine.since
+  if (engine.error !== undefined) next.error = engine.error
+  if (engine.notice !== undefined) next.notice = engine.notice
+  if (engine.lastSequence !== undefined) next.lastSequence = engine.lastSequence
+  if (engine.sessions !== undefined) next.sessions = engine.sessions
+  else if (previous.sessions !== undefined) next.sessions = previous.sessions
+  if (engine.settings !== undefined) next.settings = engine.settings
+  else if (previous.settings !== undefined) next.settings = previous.settings
+  return next
+}
+
+/** 工作区列表归一化：只接受 `{ workspaces: [...] }`，丢弃缺 id/path 的项。 */
 export function normalizeWorkspaces(raw: unknown): WorkspaceEntry[] {
   const outer = isRecord(raw) ? raw : {}
-  const list = Array.isArray(raw) ? raw : Array.isArray(outer.workspaces) ? outer.workspaces : []
+  const list = Array.isArray(outer.workspaces) ? outer.workspaces : []
   const entries: WorkspaceEntry[] = []
   for (const item of list) {
     if (!isRecord(item)) continue
@@ -179,7 +198,7 @@ export async function reconnect(): Promise<ReconnectResult> {
   const record = isRecord(raw) ? raw : {}
   return {
     ok: record.ok === true,
-    status: normalizeStatus(isRecord(record.status) ? record.status : raw),
+    status: normalizeStatus(record.status),
   }
 }
 
@@ -193,9 +212,10 @@ export async function fetchWorkspaces(): Promise<WorkspaceEntry[]> {
   return normalizeWorkspaces(await requestJson('/workspaces'))
 }
 
-/** 解除某个来源键的会话映射（DELETE /sessions/:key）。 */
-export async function deleteSession(key: string): Promise<void> {
-  await requestJson(`/sessions/${encodeURIComponent(key)}`, { method: 'DELETE' })
+/** 解除某个来源键的会话映射（DELETE /sessions/:key）；返回宿主是否真的删掉了映射。 */
+export async function deleteSession(key: string): Promise<{ removed: boolean }> {
+  const raw = await requestJson(`/sessions/${encodeURIComponent(key)}`, { method: 'DELETE' })
+  return { removed: isRecord(raw) && raw.removed === true }
 }
 
 /** 设置页表单状态：令牌单独一栏，空串表示不修改。 */
@@ -257,6 +277,18 @@ export function toPatch(form: SettingsForm): SettingsPatch {
   return patch
 }
 
+/**
+ * 保存成功文案：宿主只在 enabled / gatewayUrl / token 变化时重建网关（src/index.ts），
+ * 其余设置保存即生效。文案必须与宿主行为一致，不能一律说「已重连」。
+ */
+export function saveSuccessText(previous: SettingsForm, next: SettingsForm): string {
+  const restarts =
+    previous.enabled !== next.enabled ||
+    previous.gatewayUrl.trim() !== next.gatewayUrl.trim() ||
+    next.token.trim() !== ''
+  return restarts ? '已保存，网关已按新配置重连。' : '已保存。'
+}
+
 const STATUS_TEXT: Record<BridgeStateName, string> = {
   idle: '已断开',
   connecting: '连接中',
@@ -316,15 +348,16 @@ const C = {
   bg: 'var(--dsw-alias-bg-layer-2, #ffffff)',
   bgSoft: 'var(--dsw-alias-bg-layer-3, #f6f7f9)',
   brand: 'var(--dsw-alias-brand-primary, #4c6ef5)',
-  danger: 'var(--dsw-alias-label-danger, #b42318)',
-  dangerBg: 'var(--dsw-alias-bg-danger, #fef3f2)',
-  dangerBorder: 'var(--dsw-alias-border-danger, #fecdca)',
+  // 状态色只用宿主真实存在的 state-* token；底色统一用层色，避免深色主题下浅色块。
+  danger: 'var(--dsw-alias-state-error-primary, #b42318)',
+  dangerBg: 'var(--dsw-alias-bg-layer-3, #fef3f2)',
+  dangerBorder: 'var(--dsw-alias-state-error-primary, #fecdca)',
   success: 'var(--dsw-alias-state-success-primary, #1d7a4a)',
-  successBg: 'var(--dsw-alias-bg-success, #ecfdf3)',
-  successBorder: 'var(--dsw-alias-border-success, #abefc6)',
+  successBg: 'var(--dsw-alias-bg-layer-3, #ecfdf3)',
+  successBorder: 'var(--dsw-alias-state-success-primary, #abefc6)',
   warn: 'var(--dsw-alias-state-warn-primary, #b54708)',
-  warnBg: 'var(--dsw-alias-bg-warn, #fffaeb)',
-  warnBorder: 'var(--dsw-alias-border-warn, #fedf89)',
+  warnBg: 'var(--dsw-alias-bg-layer-3, #fffaeb)',
+  warnBorder: 'var(--dsw-alias-state-warn-primary, #fedf89)',
 } as const
 
 const styles: Record<string, React.CSSProperties> = {
@@ -368,6 +401,20 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 13,
     overflowWrap: 'anywhere',
   },
+  statusNotice: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+    border: `1px solid ${C.warnBorder}`,
+    background: C.warnBg,
+    color: C.warn,
+    borderRadius: 8,
+    padding: '8px 10px',
+    fontSize: 13,
+    overflowWrap: 'anywhere',
+  },
+  statusNoticeLabel: { fontWeight: 600, fontSize: 12 },
+  loadBox: { display: 'flex', flexDirection: 'column', gap: 10 },
   form: {
     display: 'flex',
     flexDirection: 'column',
@@ -421,7 +468,11 @@ const styles: Record<string, React.CSSProperties> = {
     font: 'inherit',
     cursor: 'pointer',
   },
-  buttonPrimary: { background: C.brand, borderColor: C.brand, color: '#ffffff' },
+  buttonPrimary: {
+    background: C.brand,
+    borderColor: C.brand,
+    color: 'var(--dsw-alias-label-primary-foreground, #ffffff)',
+  },
   buttonDanger: { background: C.dangerBg, borderColor: C.dangerBorder, color: C.danger },
   buttonDisabled: { opacity: 0.55, cursor: 'not-allowed' },
   statusBox: {
@@ -496,10 +547,6 @@ function pillStyle(tone: StatusTone): React.CSSProperties {
 
 const h = React.createElement
 
-interface SectionProps {
-  close?: () => void
-}
-
 interface FieldProps {
   label: string
   hint?: string
@@ -564,7 +611,7 @@ function formsEqual(a: SettingsForm, b: SettingsForm): boolean {
 }
 
 /** settings.section 的页面组件；副作用只发生在挂载后的 effect 与按钮回调里。 */
-function Section(_props: SectionProps): React.ReactElement {
+function Section(): React.ReactElement {
   const [form, setForm] = React.useState<SettingsForm | null>(null)
   const [saved, setSaved] = React.useState<SettingsForm | null>(null)
   const [tokenSet, setTokenSet] = React.useState(false)
@@ -572,45 +619,73 @@ function Section(_props: SectionProps): React.ReactElement {
   const [workspaces, setWorkspaces] = React.useState<WorkspaceEntry[]>([])
   const [error, setError] = React.useState<string | null>(null)
   const [notice, setNotice] = React.useState<string | null>(null)
+  const [loadError, setLoadError] = React.useState<string | null>(null)
+  const [workspaceError, setWorkspaceError] = React.useState<string | null>(null)
+  const [statusError, setStatusError] = React.useState<string | null>(null)
   const [busy, setBusy] = React.useState<string | null>(null)
+  const [reloadToken, setReloadToken] = React.useState(0)
 
+  // 三份数据相互独立：只有 settings 失败才阻断表单，工作区/状态各自降级并单独提示。
   React.useEffect(() => {
     let cancelled = false
-    Promise.all([fetchSettings(), fetchStatus(), fetchWorkspaces()])
-      .then(([settings, nextStatus, list]) => {
-        if (cancelled) return
-        const nextForm = toForm(settings)
+    setBusy('load')
+    setLoadError(null)
+    setWorkspaceError(null)
+    setStatusError(null)
+    Promise.allSettled([fetchSettings(), fetchWorkspaces(), fetchStatus()]).then((results) => {
+      if (cancelled) return
+      const [settingsResult, workspacesResult, statusResult] = results
+      if (settingsResult.status === 'fulfilled') {
+        const nextForm = toForm(settingsResult.value)
         setForm(nextForm)
         setSaved(nextForm)
-        setTokenSet(settings.tokenSet)
-        setStatus(nextStatus)
-        setWorkspaces(list)
-      })
-      .catch((reason: unknown) => {
-        if (!cancelled) setError(formatError(reason))
-      })
+        setTokenSet(settingsResult.value.tokenSet)
+      } else {
+        setLoadError(formatError(settingsResult.reason))
+      }
+      if (workspacesResult.status === 'fulfilled') {
+        setWorkspaces(workspacesResult.value)
+      } else {
+        setWorkspaces([])
+        setWorkspaceError('工作区列表读取失败，可直接填路径。')
+      }
+      if (statusResult.status === 'fulfilled') {
+        setStatus(statusResult.value)
+      } else {
+        setStatusError(formatError(statusResult.reason))
+      }
+      setBusy(null)
+    })
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [reloadToken])
 
   const update = (patch: Partial<SettingsForm>): void => {
     setForm((current) => (current === null ? null : { ...current, ...patch }))
   }
 
   const save = async (): Promise<void> => {
-    if (form === null) return
+    if (form === null || saved === null) return
+    const previous = saved
+    const nextFormToSend = form
     setBusy('save')
     setError(null)
     setNotice(null)
     try {
-      const next = await patchSettings(toPatch(form))
+      const next = await patchSettings(toPatch(nextFormToSend))
       const nextForm = toForm(next)
       setForm(nextForm)
       setSaved(nextForm)
       setTokenSet(next.tokenSet)
-      setStatus(await fetchStatus())
-      setNotice('已保存，网关已按新配置重连。')
+      setNotice(saveSuccessText(previous, nextFormToSend))
+      // PATCH 已经成功；状态刷新失败只单独提示，不能翻回「保存失败」。
+      try {
+        setStatus(await fetchStatus())
+        setStatusError(null)
+      } catch (reason) {
+        setNotice(`已保存，但状态刷新失败：${formatError(reason)}`)
+      }
     } catch (reason) {
       setError(formatError(reason))
     } finally {
@@ -621,10 +696,12 @@ function Section(_props: SectionProps): React.ReactElement {
   const refreshStatus = async (): Promise<void> => {
     setBusy('refresh')
     setError(null)
+    setNotice(null)
     try {
       setStatus(await fetchStatus())
+      setStatusError(null)
     } catch (reason) {
-      setError(formatError(reason))
+      setStatusError(formatError(reason))
     } finally {
       setBusy(null)
     }
@@ -636,7 +713,9 @@ function Section(_props: SectionProps): React.ReactElement {
     setNotice(null)
     try {
       const result = await reconnect()
-      setStatus(result.status)
+      // 重连响应只有引擎状态：合并而不是整包覆盖，否则会话映射表会被清空。
+      setStatus((previous) => mergeEngineStatus(previous, result.status))
+      setStatusError(null)
       setNotice(result.ok ? '已请求重新连接。' : '重新连接未成功。')
     } catch (reason) {
       setError(formatError(reason))
@@ -650,9 +729,16 @@ function Section(_props: SectionProps): React.ReactElement {
     setError(null)
     setNotice(null)
     try {
-      await deleteSession(key)
-      setStatus(await fetchStatus())
-      setNotice(`已解除映射：${key}`)
+      const result = await deleteSession(key)
+      if (result.removed) {
+        setStatus((previous) => {
+          if (previous === null || previous.sessions === undefined) return previous
+          const sessions = { ...previous.sessions }
+          delete sessions[key]
+          return { ...previous, sessions }
+        })
+      }
+      setNotice(result.removed ? `已解除映射：${key}` : `这条映射已不存在：${key}`)
     } catch (reason) {
       setError(formatError(reason))
     } finally {
@@ -661,8 +747,15 @@ function Section(_props: SectionProps): React.ReactElement {
   }
 
   const dirty = form !== null && saved !== null && !formsEqual(form, saved)
-  const sessionEntries: Array<[string, SessionEntry]> = status === null ? [] : Object.entries(status.sessions)
+  const sessionEntries: Array<[string, SessionEntry]> =
+    status === null || status.sessions === undefined ? [] : Object.entries(status.sessions)
   const disabled = busy !== null
+  const savedEnabled = saved?.enabled ?? status?.settings?.enabled
+  const enabledPending = dirty && form !== null && saved !== null && form.enabled !== saved.enabled
+  const enabledText =
+    savedEnabled === undefined ? '—' : savedEnabled ? '已启用' : '已停用'
+  const workspaceKnown =
+    form === null || form.workspaceId === '' || workspaces.some((workspace) => workspace.id === form.workspaceId)
 
   return h(
     'div',
@@ -678,7 +771,24 @@ function Section(_props: SectionProps): React.ReactElement {
     error === null ? null : h('div', { style: styles.errorBox }, error),
     notice === null ? null : h('div', { style: styles.noticeBox }, notice),
     form === null
-      ? h('p', { style: styles.hint }, '正在读取配置…')
+      ? h(
+          'div',
+          { style: styles.loadBox },
+          loadError === null
+            ? h('p', { style: styles.hint }, '正在读取配置…')
+            : h('div', { style: styles.errorBox }, `读取设置失败：${loadError}`),
+          loadError === null
+            ? null
+            : h(
+                'div',
+                { style: styles.actions },
+                h(
+                  Button,
+                  { disabled, onClick: () => setReloadToken((token) => token + 1) },
+                  busy === 'load' ? '重试中…' : '重试',
+                ),
+              ),
+        )
       : h(
           'div',
           { style: styles.form },
@@ -723,7 +833,13 @@ function Section(_props: SectionProps): React.ReactElement {
           ),
           h(
             Field,
-            { label: '工作区', hint: '留空表示不绑定，新建会话使用 DSH 的默认工作区。' },
+            {
+              label: '工作区',
+              hint:
+                workspaceError === null
+                  ? '留空表示不绑定，新建会话使用 DSH 的默认工作区。'
+                  : `${workspaceError}留空表示不绑定。`,
+            },
             h(
               'select',
               {
@@ -733,8 +849,19 @@ function Section(_props: SectionProps): React.ReactElement {
                 style: styles.input,
               },
               h('option', { value: '' }, '不绑定（使用默认工作区）'),
+              workspaceKnown
+                ? null
+                : h(
+                    'option',
+                    { key: form.workspaceId, value: form.workspaceId },
+                    `${form.workspaceId}（当前值，不在工作区列表中）`,
+                  ),
               ...workspaces.map((workspace) =>
-                h('option', { key: workspace.id, value: workspace.id }, workspace.title ?? workspace.path),
+                h(
+                  'option',
+                  { key: workspace.id, value: workspace.id },
+                  workspace.title === undefined ? workspace.path : `${workspace.title}（${workspace.path}）`,
+                ),
               ),
             ),
           ),
@@ -819,8 +946,6 @@ function Section(_props: SectionProps): React.ReactElement {
               { tone: 'primary', disabled: !dirty || disabled, onClick: () => void save() },
               busy === 'save' ? '保存中…' : '保存',
             ),
-            h(Button, { disabled, onClick: () => void refreshStatus() }, '刷新状态'),
-            h(Button, { disabled, onClick: () => void reconnectNow() }, '重新连接'),
             dirty ? h('span', { style: styles.dirty }, '有未保存的修改') : null,
           ),
         ),
@@ -833,6 +958,15 @@ function Section(_props: SectionProps): React.ReactElement {
         h('span', { style: styles.statusTitle }, '连接状态'),
         h(Pill, { text: formatStatus(status), tone: statusTone(status?.state) }),
       ),
+      status?.notice === undefined
+        ? null
+        : h(
+            'div',
+            { style: styles.statusNotice },
+            h('span', { style: styles.statusNoticeLabel }, '网关提示'),
+            h('span', null, status.notice),
+          ),
+      statusError === null ? null : h('p', { style: styles.hint }, `状态读取失败：${statusError}`),
       h(
         'div',
         { style: styles.statusGrid },
@@ -842,7 +976,10 @@ function Section(_props: SectionProps): React.ReactElement {
           value: status?.lastSequence === undefined ? '—' : String(status.lastSequence),
         }),
         h(StatusLine, { label: '会话数', value: String(sessionEntries.length) }),
-        h(StatusLine, { label: '启用状态', value: form?.enabled === true ? '已启用' : '已停用' }),
+        h(StatusLine, {
+          label: '启用状态',
+          value: enabledPending ? `${enabledText}（有未保存的修改）` : enabledText,
+        }),
       ),
       h(
         'div',
@@ -908,29 +1045,27 @@ interface SectionSlotOptions {
 
 interface SlotsService {
   inject(name: 'settings.section', contribute: () => () => void): () => void
-  register(options: SectionSlotOptions, component: React.ComponentType<SectionProps>): () => void
+  register(options: SectionSlotOptions, component: React.ComponentType): () => void
 }
 
 /** 客户端插件可用的最小 ctx 面；其余能力由本文件的 API 层直接走 loopback 路由。 */
 interface ClientContext {
   slots: SlotsService
-  effect(execute: () => () => void, label?: string): () => void
 }
 
-/** 等待 slot 服务就绪后再注册，卸载由 ctx.effect 回卷。 */
+/** 等待 slot 服务就绪后再注册；slot 注册自身由宿主 fiber 记账。 */
 export const inject = ['slots']
 
-/** 注册设置页分区；一切注册都经 ctx.effect 记账。 */
+/**
+ * 注册设置页分区。`ctx.slots.inject()` 直接交给 slot 服务记账（与 dsh-n8n-plugin 一致），
+ * 页面卸载时由 slot 回卷本分区，无需再套一层 ctx.effect。
+ */
 export const apply = (ctx: unknown): void => {
   const client = ctx as ClientContext
-  client.effect(
-    () =>
-      client.slots.inject('settings.section', () =>
-        client.slots.register(
-          { name: 'settings.section', id: 'lanpost-bridge', order: 120, label: () => 'lanpost 连接' },
-          Section,
-        ),
-      ),
-    'lanpost-bridge settings section',
+  client.slots.inject('settings.section', () =>
+    client.slots.register(
+      { name: 'settings.section', id: 'lanpost-bridge', order: 120, label: () => 'lanpost 连接' },
+      Section,
+    ),
   )
 }
