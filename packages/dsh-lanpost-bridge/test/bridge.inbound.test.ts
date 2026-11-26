@@ -27,6 +27,7 @@ function setup(overrides: any = {}) {
   const renames: any[] = []
   const logs: string[] = []
   const audits: any[] = []
+  let listener: ((sessionId: string, event: any) => void) | undefined
   const deps: any = {
     state: () => state,
     update: (mutate: (s: any) => void) => mutate(state),
@@ -48,10 +49,31 @@ function setup(overrides: any = {}) {
       sent.push({ target, text })
       return { message_id: 'm', delivery_status: 'queued' }
     },
-    onSessionEvent: () => () => {},
+    // Task 7 起 handleMessage 会等 turn/end 再回发；入站用例只关心「消息有没有投进会话」，
+    // 所以假 prompt 被接受后立刻补一个 user/message + turn/end，模拟本轮正常完成。
+    onSessionEvent: (handler: any) => {
+      listener = handler
+      return () => {
+        listener = undefined
+      }
+    },
     log: (message: string) => logs.push(message),
     audit: (kind: string, detail: any) => audits.push({ kind, detail }),
     ...overrides.deps,
+  }
+  const emit = (sessionId: string, event: any): void => listener?.(sessionId, event)
+  const promptImpl = deps.sessions.prompt
+  deps.sessions = {
+    ...deps.sessions,
+    prompt: async (request: any, signal: any) => {
+      const result = await promptImpl(request, signal)
+      emit(request.sessionId, {
+        type: 'user/message',
+        data: { source: { kind: 'user', rpcId: request.requestId } },
+      })
+      emit(request.sessionId, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+      return result
+    },
   }
   const bridge = new InboundBridge(deps)
   running.push(bridge)
