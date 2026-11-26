@@ -46,9 +46,9 @@ export interface ToolDefinitionLike {
   execute(args: unknown, exec: { signal?: AbortSignal }): Promise<unknown>
 }
 
-/** 精确匹配的 HTTP 路由：`/api/lanpost-bridge/*` 全用这个形状。 */
+/** HTTP 路由：`exact` 逐字匹配路径，`prefix` 匹配自身及其 `/` 子路径。 */
 export interface WebRouteLike {
-  kind: 'exact'
+  kind: 'exact' | 'prefix'
   path: string
   handler(req: any, res: any): void | Promise<void>
 }
