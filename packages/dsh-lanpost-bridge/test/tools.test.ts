@@ -134,6 +134,33 @@ function firstText(tool: ToolDefinitionLike, args: unknown, value: unknown): str
   return blocks[0].text
 }
 
+/**
+ * 宿主在 render 前用工具自己的 output.schema 校验返回值，且对象一律
+ * `additionalProperties: false`：多一个未声明的键就直接 `invalid output`。
+ * 这里做同构的键集合检查，把驼峰/下划线这类漂移挡在测试阶段。
+ */
+function assertDeclaredKeys(schema: unknown, value: unknown, path: string): void {
+  if (Array.isArray(value)) {
+    const items = asRecord(schema).items
+    if (items !== undefined) {
+      value.forEach((item, index) => assertDeclaredKeys(items, item, `${path}[${index}]`))
+    }
+    return
+  }
+  if (typeof value !== 'object' || value === null) return
+  const properties = asRecord(schema).properties
+  if (properties === undefined) return
+  const declared = asRecord(properties)
+  for (const key of Object.keys(value)) {
+    assert.ok(key in declared, `${path}.${key} 未在 output schema 中声明`)
+  }
+  for (const [key, child] of Object.entries(declared)) {
+    if (key in (value as Record<string, unknown>)) {
+      assertDeclaredKeys(child, (value as Record<string, unknown>)[key], `${path}.${key}`)
+    }
+  }
+}
+
 function usersPayload(): { users: Array<Record<string, unknown>> } {
   return {
     users: Array.from({ length: 30 }, (_, index) => ({
@@ -184,6 +211,43 @@ test('createTools 按顺序暴露三个工具，parameters/output 都是自包�
   const status = toolNamed(tools, 'lanpost_bridge_status')
   assert.match(status.description, /令牌/)
   assert.deepEqual(status.parameters.properties, {})
+})
+
+test('所有工具的成功与失败输出都只含 output schema 声明的字段', async () => {
+  const online = allTools({ gateway: () => makeGateway().gateway })
+  const offline = allTools()
+  const listed = allTools({
+    gateway: () =>
+      makeGateway({
+        call: async () => ({
+          total: 3,
+          users: [
+            {
+              protocol_id: 'p1',
+              username: 'u1',
+              display_name: 'U1',
+              online: true,
+              last_seen_at: null,
+            },
+          ],
+        }),
+      }).gateway,
+  })
+
+  const cases: Array<[string, ToolDefinitionLike, unknown]> = [
+    ['send 成功', toolNamed(online, 'lanpost_send_message'), { target: 'user', protocol_id: 'p1', content: 'hi' }],
+    ['send 未连接', toolNamed(offline, 'lanpost_send_message'), { target: 'user', protocol_id: 'p1', content: 'hi' }],
+    ['list 成功（有 total）', toolNamed(listed, 'lanpost_list_contacts'), { keyword: 'u' }],
+    ['list 成功（无 total）', toolNamed(online, 'lanpost_list_contacts'), {}],
+    ['list 参数错误', toolNamed(online, 'lanpost_list_contacts'), { page: 0 }],
+    ['list 未连接', toolNamed(offline, 'lanpost_list_contacts'), { keyword: 'u' }],
+    ['status 未连接', toolNamed(offline, 'lanpost_bridge_status'), {}],
+  ]
+
+  for (const [label, tool, args] of cases) {
+    const value = await tool.execute(args, {})
+    assertDeclaredKeys(tool.output.schema, value, label)
+  }
 })
 
 test('私聊发送走 sendUser 并返回 ok/messageId/deliveryStatus', async () => {
