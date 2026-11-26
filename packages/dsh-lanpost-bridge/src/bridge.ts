@@ -31,10 +31,6 @@ export const QUEUE_FULL_NOTICE = `我这边还排着 ${QUEUE_LIMIT} 条消息，
 export const EMPTY_REPLY_NOTICE = '（本轮没有文本回复）'
 /** 等不到 `turn/end` 时的收尾说明；已累积的文本保留在前面。 */
 export const TIMEOUT_NOTICE = '处理超时，已放弃等待。'
-/** 插件停用时对 pending 回合的收尾说明。 */
-export const CANCELED_NOTICE = '插件已停用，本轮回复已取消。'
-/** 非正常结束的通用说明（error 额外追加一句）。 */
-export const ERROR_NOTICE = '本轮执行出错。'
 /** 思考引用的截断长度（字符数）。 */
 const REASONING_QUOTE_CHARS = 500
 
@@ -50,7 +46,7 @@ export interface TurnReplyInput {
   elapsedMs: number
   /** 是否附带思考引用与用量统计。 */
   showProcess: boolean
-  /** `completed` / `timeout` / `canceled` / `turn/end` 的 `reason.kind`。 */
+  /** `completed` / `timeout`，或 `turn/end` 的 `reason.kind`。 */
   reason: string
 }
 
@@ -75,11 +71,10 @@ function withProcess(text: string, input: TurnReplyInput): string {
 
 /**
  * 组装一轮的最终回复。状态文案是设计文档 7.5 的固定字符串：
- * 超时保留已收集文本，取消不回半截内容，异常结束只讲原因（error 额外提示出错）。
+ * 超时保留已收集文本；异常结束（error/aborted/max-tokens/blocked…）丢掉半截正文、只讲原因。
+ * `showProcess` 打开时所有结算分支都追加「— 用时 X，工具 N 次」（有思考时先附引用）。
  */
 export function formatTurnReply(input: TurnReplyInput): string {
-  if (input.reason === 'canceled') return CANCELED_NOTICE
-
   const body = input.texts.join('').trim()
   const blank = body === ''
 
@@ -88,9 +83,7 @@ export function formatTurnReply(input: TurnReplyInput): string {
   }
 
   if (input.reason !== 'completed') {
-    const head = blank ? '' : `${body}\n\n`
-    const notice = `这一轮没有正常完成（${input.reason}）。`
-    return input.reason === 'error' ? `${head}${notice}\n\n${ERROR_NOTICE}` : `${head}${notice}`
+    return withProcess(`这一轮没有正常完成（${input.reason}）。`, input)
   }
 
   return withProcess(blank ? EMPTY_REPLY_NOTICE : body, input)
@@ -273,14 +266,16 @@ export class InboundBridge {
       return
     }
 
-    await this.enqueue(plan.key, async () => {
+    // ACK 只表示「这条事件已被接管」：等 prompt 被接受（waiter 已登记）就返回，
+    // 回复由队列在后台继续；但同会话的下一轮仍要等这一轮结算后才投递。
+    await this.enqueue(plan.key, async (accepted) => {
       if (plan.kind === 'notice') {
         const notice: NoticePlan = plan
         await this.reply(notice.target, notice.text)
         return
       }
       const promptPlan: PromptPlan = plan
-      await this.process(promptPlan, event)
+      await this.process(promptPlan, event, accepted)
     })
   }
 
@@ -296,15 +291,19 @@ export class InboundBridge {
     this.deps.log(`lanpost-bridge: delivery ${status.status} for ${messageId}`)
   }
 
-  /** 停掉队列与订阅：pending 回合以「已取消」结算，新消息一律丢弃。 */
+  /**
+   * 停掉队列与订阅：pending 回合静默取消（设计 §11 卸载只清理，不发消息）。
+   * 卸载/重载时网关通常已在关闭，`send` 多半失败；这里只记日志与审计。
+   */
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
     this.unsubscribe?.()
     this.unsubscribe = undefined
-    // 先退订再结算：结算过程中的发送失败不会因为事件回流而重入。
-    for (const waiter of [...this.waiters.values()]) this.settle(waiter, 'canceled')
-    // 在途 prompt 一并中止：等待器已结算，迟到的接受不该再让回合继续跑。
+    const pending = this.waiters.size
+    for (const waiter of [...this.waiters.values()]) this.cancelWaiter(waiter)
+    if (pending > 0) this.deps.log(`lanpost-bridge: disposed with ${pending} pending turn(s)`)
+    // 在途 prompt 一并中止：等待器已取消，迟到的接受不该再让回合继续跑。
     for (const controller of this.inflight) controller.abort(new Error('lanpost-bridge: disposed'))
     this.inflight.clear()
     this.queues.clear()
@@ -330,7 +329,10 @@ export class InboundBridge {
       case 'assistant/message': {
         const waiter = this.activeWaiter(sessionId)
         if (!waiter) return
-        for (const block of event.data.message.content) {
+        const content: unknown = event.data?.message?.content
+        if (!Array.isArray(content)) return
+        for (const block of content) {
+          if (typeof block !== 'object' || block === null) continue
           if (typeof block.text !== 'string') continue
           if (block.type === 'text') waiter.texts.push(block.text)
           else if (block.type === 'reasoning') waiter.reasoning.push(block.text)
@@ -343,9 +345,11 @@ export class InboundBridge {
         return
       }
       case 'turn/end': {
+        const kind: unknown = event.data?.reason?.kind
+        if (typeof kind !== 'string' || kind === '') return
         const waiter = this.activeWaiter(sessionId)
         if (!waiter) return
-        this.settle(waiter, event.data.reason.kind)
+        this.settle(waiter, kind)
         return
       }
     }
@@ -397,6 +401,16 @@ export class InboundBridge {
     waiter.resolve()
   }
 
+  /** 停用时静默取消：不回发任何消息，只记审计并让队列继续收尾。 */
+  private cancelWaiter(waiter: TurnWaiter): void {
+    if (waiter.settled) return
+    waiter.settled = true
+    if (waiter.timer) clearTimeout(waiter.timer)
+    this.waiters.delete(waiter.requestId)
+    this.audit({ action: 'turn-canceled', sessionId: waiter.sessionId })
+    waiter.resolve()
+  }
+
   /** 结算一轮：先摘掉等待器再回发，保证重复 `turn/end` / 超时不会回第二次。 */
   private settle(waiter: TurnWaiter, reason: string): void {
     if (waiter.settled) return
@@ -418,7 +432,8 @@ export class InboundBridge {
 
   /**
    * 逐段回发。发送是调用即返回（网关投递回执另走 `handleDelivery`），
-   * 某段失败后不再尝试后续段：宁可少发，也不要半截消息后面又接上。
+   * 某段抛错后不再尝试后续段：宁可少发，也不要半截消息后面又接上。
+   * `delivery_status === 'failed'` 表示网关已受理但投递失败：记失败审计，后续段照发。
    */
   private async deliverReply(waiter: TurnWaiter, reason: string): Promise<void> {
     const text = formatTurnReply({
@@ -430,10 +445,13 @@ export class InboundBridge {
       reason,
     })
     const parts = replyParts(text)
+    let failures = 0
 
     for (let index = 0; index < parts.length; index += 1) {
+      let deliveryStatus = ''
       try {
-        await this.deps.send(waiter.target, parts[index])
+        const result = await this.deps.send(waiter.target, parts[index])
+        if (typeof result?.delivery_status === 'string') deliveryStatus = result.delivery_status
       } catch (error) {
         this.deps.log(
           `lanpost-bridge: reply segment ${index + 1}/${parts.length} failed: ${errorMessage(error)}`,
@@ -447,9 +465,21 @@ export class InboundBridge {
         })
         return
       }
+
+      if (deliveryStatus === 'failed') {
+        failures += 1
+        this.deps.log(`lanpost-bridge: reply segment ${index + 1}/${parts.length} delivery failed`)
+        this.audit({
+          action: 'reply-send-failed',
+          reason,
+          segment: index + 1,
+          total: parts.length,
+          status: deliveryStatus,
+        })
+      }
     }
 
-    this.audit({ action: 'reply-sent', reason, segments: parts.length })
+    if (failures === 0) this.audit({ action: 'reply-sent', reason, segments: parts.length })
   }
 
   private now(): number {
@@ -538,7 +568,12 @@ export class InboundBridge {
 
   // ── 串行队列 ────────────────────────────────────────────────────────────
 
-  private enqueue(key: string, task: () => Promise<void>): Promise<void> {
+  /**
+   * 把任务排进会话键的串行链，返回「调用方可以放行 ACK」的 promise。
+   * `accepted` 由任务自己在该轮 prompt 被接受后调用；任务本身继续跑完整轮
+   * （含回复发送），链尾才会前进，从而保住同会话串行。
+   */
+  private enqueue(key: string, task: (accepted: () => void) => Promise<void>): Promise<void> {
     let slot = this.queues.get(key)
     if (!slot) {
       slot = { pending: 0, tail: Promise.resolve() }
@@ -547,15 +582,22 @@ export class InboundBridge {
     const current = slot
     current.pending += 1
 
+    let markAccepted: () => void = () => {}
+    const accepted = new Promise<void>((resolve) => {
+      markAccepted = resolve
+    })
+
     const run = async (): Promise<void> => {
       try {
         if (this.disposed) return
-        await task()
+        await task(markAccepted)
       } catch (error) {
         // 队列必须继续跑：错误写日志与审计，不把整条链堵死。
         this.deps.log(`lanpost-bridge: inbound task for ${key} failed: ${errorMessage(error)}`)
         this.audit({ action: 'queue-failed', key, error: errorMessage(error) })
       } finally {
+        // 任何异常都不能让调用方永远等 ACK。
+        markAccepted()
         current.pending -= 1
         if (current.pending === 0 && this.queues.get(key) === current) this.queues.delete(key)
       }
@@ -563,21 +605,31 @@ export class InboundBridge {
 
     const chain = current.tail.then(run, run)
     current.tail = chain
-    return chain
+    return accepted
   }
 
   // ── 处理 ────────────────────────────────────────────────────────────────
 
-  private async process(plan: PromptPlan, event: InboundMessage): Promise<void> {
+  private async process(
+    plan: PromptPlan,
+    event: InboundMessage,
+    accepted: () => void,
+  ): Promise<void> {
     let phase: 'session' | 'prompt' = 'session'
     try {
       const session = await this.ensureSession(plan.key, plan.source, event)
-      if (this.disposed) return
+      if (this.disposed) {
+        accepted()
+        return
+      }
       phase = 'prompt'
-      await this.deliver(plan, session.sessionId, event)
+      await this.deliver(plan, session.sessionId, event, accepted)
     } catch (error) {
-      // 停用期间被中止的 prompt 不是业务失败，收尾提示已由 dispose 结算。
-      if (this.disposed) return
+      // 停用期间被中止的 prompt 不是业务失败，不回任何消息（dispose 静默取消）。
+      if (this.disposed) {
+        accepted()
+        return
+      }
       const text =
         phase === 'session'
           ? `创建会话失败：${errorMessage(error)}`
@@ -591,6 +643,8 @@ export class InboundBridge {
         error: errorMessage(error),
       })
       await this.reply(plan.target, text)
+      // 失败提示发完再放行 ACK，保持失败路径原有的「await 后可见」语义。
+      accepted()
     }
   }
 
@@ -619,9 +673,10 @@ export class InboundBridge {
     plan: PromptPlan,
     sessionId: string,
     event: InboundMessage,
+    accepted: () => void,
   ): Promise<void> {
     try {
-      await this.prompt(plan, sessionId)
+      await this.prompt(plan, sessionId, accepted)
       return
     } catch (error) {
       if (errorCode(error) !== 'session/not-found') throw error
@@ -632,10 +687,10 @@ export class InboundBridge {
 
     // 会话在 GUI 里被删了：重建一次再投一遍，不把错误甩给用户。
     const recreated = await this.ensureSession(plan.key, plan.source, event)
-    await this.prompt(plan, recreated.sessionId)
+    await this.prompt(plan, recreated.sessionId, accepted)
   }
 
-  private async prompt(plan: PromptPlan, sessionId: string): Promise<void> {
+  private async prompt(plan: PromptPlan, sessionId: string, accepted: () => void): Promise<void> {
     const request: PromptRequest = {
       requestId: `lanpost-${randomUUID()}`,
       sessionId,
@@ -662,7 +717,8 @@ export class InboundBridge {
       this.inflight.delete(controller)
     }
 
-    // prompt 只表示「已入队」；最终文本要等本轮 turn/end（或超时/停用）才回发。
+    // prompt 已被接受、waiter 已登记：此时才放行 ACK；随后继续等本轮结算。
+    accepted()
     await waiter.done
   }
 
