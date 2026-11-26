@@ -1,0 +1,12 @@
+node_modules/
+lib/
+.dsh-dev/
+*.tsbuildinfo
+
+# SDD 过程产物（ledger/briefs/reports）
+.sdd/
+
+# 运行时/临时产物
+*.log
+*.zip
+.DS_Store

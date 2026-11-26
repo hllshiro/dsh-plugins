@@ -1,0 +1,5 @@
+# 我们的插件行：insert 进组合，行 id 以 our- 前缀避免与官方行冲突
+# 发行组合中另需 patch 禁用官方品牌行 ui-brand-official（见 dev/cordis.patch.yml 示例）
+- insert:
+    - id: our-ui-brand
+      name: '@hllshiro/ui-brand'

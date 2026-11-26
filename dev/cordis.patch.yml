@@ -1,0 +1,9 @@
+# 开发调试覆盖层：pnpm dev 以 --patch 传入，位于组合的高层，可临时改任何一行。
+# 临时禁用某行：
+# - id: our-ui-brand
+#   disabled: true
+# 覆盖某行配置（config 是整体替换，不是深合并）：
+# - id: our-business-example
+#   config:
+#     debug: true
+[]

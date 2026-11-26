@@ -1,0 +1,17 @@
+{
+  "name": "ai-agent-plugins",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "check": "tsc --noEmit",
+    "inject": "pnpm run build && node scripts/inject.mjs",
+    "dev": "pnpm run inject && node scripts/dev.mjs"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh": "0.2.2-rc.5",
+    "@types/node": "^24.0.0",
+    "tsdown": "catalog:",
+    "typescript": "catalog:"
+  }
+}
