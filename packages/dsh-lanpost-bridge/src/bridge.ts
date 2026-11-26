@@ -195,17 +195,19 @@ function isBlank(text: string): boolean {
 /** 外部可控名字（显示名/用户名/群 id）截断到的最大码点数。 */
 const SOURCE_TEXT_MAX = 64
 /** 控制字符、零宽字符与 bidi 覆盖字符：折叠为空格，防止伪造来源行。 */
-const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2028\u2029\u2066-\u2069]/g
+const CONTROL_CHARS =
+  /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u206F]/g
 
 /**
- * 净化要进来源行/会话标题的外部字符串：控制与不可见字符→空格、去掉方括号、
+ * 净化要进来源行/会话标题的外部字符串：控制与不可见字符→空格、方括号→空格、
  * 空白折叠、按码点截断；净化后为空时回退 `fallback`。
- * `display_name`、`username`、`group_id` 都来自对端，不净化就能插入换行伪造来源行。
+ * 只用于**展示面**（prompt 首行、会话标题）；`display_name`、`username`、`group_id`
+ * 都来自对端，不净化就能插入换行伪造来源行。
  */
 function sanitizeSourceText(raw: string, fallback: string): string {
   const cleaned = raw
     .replace(CONTROL_CHARS, ' ')
-    .replace(/[[\]]/g, '')
+    .replace(/[[\]]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
   const clipped = Array.from(cleaned).slice(0, SOURCE_TEXT_MAX).join('').trim()
@@ -500,8 +502,10 @@ export class InboundBridge {
     const username = sanitizeSourceText(event.sender.username, '')
     const displayName = sanitizeSourceText(event.sender.displayName, '')
     const whoName = displayName !== '' ? displayName : username !== '' ? username : '未知用户'
-    const rawGroupId = groupIdOf(event)
-    const groupId = rawGroupId === undefined ? undefined : sanitizeSourceText(rawGroupId, '未知群')
+    // 键与回复目标用对端原值；只有展示面（prompt 首行/会话标题）净化。
+    const groupId = groupIdOf(event)
+    const displayGroupId =
+      groupId === undefined ? undefined : sanitizeSourceText(groupId, '未知群')
     // gateway 把非 `group` 归一成 `private`；会话键是 `group:` 的消息仍要按群门禁处理。
     const isGroup = event.conversationType === 'group' || groupId !== undefined
 
@@ -510,7 +514,7 @@ export class InboundBridge {
 
       const key = `${GROUP_PREFIX}${groupId}`
       const target: ReplyTarget = { kind: 'group', groupId }
-      const source: ReplySource = { kind: 'group', name: whoName, username, groupId }
+      const source: ReplySource = { kind: 'group', name: whoName, username, groupId: displayGroupId }
 
       if (text === null) return { kind: 'drop', reason: 'unsupported-content' }
       const stripped = groupBodyOf(text)

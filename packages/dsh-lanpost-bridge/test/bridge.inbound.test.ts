@@ -600,3 +600,21 @@ test('event_id 与 message_id 都为空时不进去重窗口', async () => {
   assert.equal(s.prompts.length, 2)
   assert.deepEqual(s.state.seenEventIds, [])
 })
+
+test('群 id 只在展示面净化，会话键与回复目标用对端原值', async () => {
+  const s = setup()
+  const rawGroupId = 'g]1\n['
+  await s.bridge.handleMessage(
+    msg({
+      conversationType: 'group',
+      groupId: rawGroupId,
+      content: { type: 'text', text: '/dsh 你好' },
+    }),
+  )
+  // 展示面（prompt 首行与标题）是净化后的单行。
+  assert.equal(s.prompts[0].content[0].text, '[lanpost 群 g 1 · 张三 (zhangsan)]\n\n你好')
+  assert.equal(s.renames[0].title, 'lanpost · 群 g 1')
+  // 键与回复目标保留原值：两个只差方括号的群不会撞同一个会话，回复也不会发错群。
+  assert.equal(s.state.sessions[`group:${rawGroupId}`].sessionId, 'sess-1')
+  assert.deepEqual(s.sent[0].target, { kind: 'group', groupId: rawGroupId })
+})
