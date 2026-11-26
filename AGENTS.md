@@ -38,6 +38,7 @@ DSH 插件的开发仓库：pnpm workspace，一个插件一个包，经 `link:`
 - host 代码改动重启 `dsh web` 生效；客户端 bundle 改动经 rev 重哈希热刷新；`dev/cordis.patch.yml` 改动 HMR 热组合。
 - 插件不生效先看 `--dump-config` 的组合行，再看激活审计（fiber 因 `inject` 服务缺失停在 inactive 是常见原因），最后看 `ctx.logger` 输出。
 - `.dsh-dev/` 的 profile 由 `dsh plugin` 命令维护，组合改动走 `dev/cordis.patch.yml` 与 `pnpm run inject`，不手工编辑。
+- `dsh-lanpost-bridge` 的真实链路要 lanpost-im 客户端在场（内嵌网关默认 `wss://127.0.0.1:8443/ws/dsh` + 令牌），本机没有客户端时只能验证到「插件激活 + 设置页路由」；工具 output schema 只支持宿主子集（`type/oneOf/properties/required/additionalProperties/items/enum/const`，**不能用 `anyOf`**，否则插件激活即失败）。
 
 ## 指针
 

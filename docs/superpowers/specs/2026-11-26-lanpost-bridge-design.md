@@ -1,8 +1,8 @@
 # DSH ↔ lanpost-im 适配插件 设计文档
 
 - 日期：2026-11-26
-- 包：`packages/lanpost-bridge` → `@hllshiro/lanpost-bridge`（行 id `our-lanpost-bridge`）
-- 状态：待评审
+- 包：`packages/dsh-lanpost-bridge` → `@hllshiro/dsh-lanpost-bridge`（行 id `our-dsh-lanpost-bridge`）
+- 状态：已实现（2026-11-26）；实现过程中的偏差与验证结论见 §15
 - 协议依据：lanpost Agent Gateway API 1.0（2026-11-26 冻结），原文 `C:\Users\xqkj\.dsh\attachments\v1\files\71\7172fc40dee5d9ecbe34699d197ace3a21a9b1379503e50779becdb5e77d7a62\gateway-api.md`
 
 ## 1. 目标
@@ -138,7 +138,7 @@ packages/lanpost-bridge/
   2. 累积 `assistant/message` 的 `text` 块；`showProcess=true` 时把 `reasoning` 块以 `> ` 引用形式收进附注；`tool/call` 计数；
   3. `turn/end` 收尾，`reason` 不是完成态时文本换成「这一轮没有正常完成（<reason>）」；
   4. 兜底超时 10 分钟 → 回「处理超时，已放弃等待」，不 cancel agent（用户可以自己看会话）。
-- 文本为空 → 「（DSH 没有产生文本回复）」。
+- 文本为空 → 「（本轮没有文本回复）」。
 - 回复按 UTF-8 字节切段（每段 ≤ 4000 字节且不切坏多字节字符），多段时加 `(1/3)` 角标，逐条 `sendUser`/`sendGroup`，`request_id` 每段独立。
 - 回复目标：私聊回 `sender.protocol_id`；群回 `group_id`。
 - `showProcess=true` 时末尾追加一行：`— 用时 12.3s，工具 4 次`。
@@ -199,7 +199,7 @@ packages/lanpost-bridge/
 
 ## 12. 验证清单（AGENTS.md 完成判据）
 
-1. `pnpm run check`、`pnpm run build` 通过；`DSH_HOME=.dsh-dev pnpm run inject` 后有 `✓ our-lanpost-bridge`，`--dump-config` 里 our- 行 3 条。
+1. `pnpm run check`、`pnpm run build` 通过；`DSH_HOME=.dsh-dev pnpm run inject` 后有 `✓ our-dsh-lanpost-bridge`，`--dump-config` 里 our- 行 3 条。
 2. 在运行中的 `dsh web`（GUI http://127.0.0.1:30894）实测：
    - 设置页能保存并热应用（改地址 → 状态变化，不必重启）；
    - 私聊发一条 → 侧栏出现 `lanpost · …` 会话、agent 正常回答、lanpost 收到回复；
@@ -222,3 +222,32 @@ packages/lanpost-bridge/
 1. **M1 链路**：gateway + store + bridge（先固定一个默认会话/工作区，无面板），用脚本或工具手动跑通「私聊 → 会话 → 回复」。
 2. **M2 面板**：routes + 设置页 + 工作区下拉 + 映射表 + 状态；接上「继续/新建」两种模式。
 3. **M3 打磨**：审计、失败矩阵、切段、思考摘要、README、验证清单全绿。
+
+## 15. 实现记录与偏差（2026-11-26）
+
+### 15.1 落地形态
+
+- 包 `packages/dsh-lanpost-bridge`（`@hllshiro/dsh-lanpost-bridge`，行 id `our-dsh-lanpost-bridge`），host ESM + client `__ModuleLoader__` 双面包；`ws` 外置（`lib/index.js` 第 3 行 `import WebSocket from "ws"`）。
+- 源文件：`core.ts`（常量与纯函数）、`store.ts`（`$DSH_HOME/dsh-lanpost-bridge.json`，0600 原子写）、`gateway.ts`（握手/ACK/退避）、`bridge.ts`（入站过滤+映射+串行队列+回复收集）、`tools.ts`（3 个工具）、`routes.ts`（5 条 `/api/lanpost-bridge/*`）、`index.ts`（装配与生命周期）、`harness.ts`（唯一 ctx 类型断言点）、`audit.ts`、`client.ts`（设置页）。
+
+### 15.2 与本文档的偏差（均已实现并测试）
+
+1. 包名/行 id 加 `dsh-` 前缀（用户要求）。
+2. 工具参数为 `target` + `protocol_id`/`group_id` + `content`；`group_id` 只能来自入站来源行或用户提供。
+3. 非 completed 回合只回「这一轮没有正常完成（<kind>）。」，不拼半截正文（删 `ERROR_NOTICE`）。
+4. 插件停用/重载时静默取消在途回合，不回「已取消」消息。
+5. **ACK 语义**：处理并持久化（去重、映射、prompt 被接受）后即 ACK，不等整轮 `turn/end`；回复后台串行投递，避免 10 分钟回合阻塞网关通知链。
+6. 空回复文案「（本轮没有文本回复）」；满队列回 `QUEUE_FULL_NOTICE`。
+7. `deliveryStatus` 为 `string | null`，网关未返回时不伪造状态值。
+8. 路由前缀 `/api/lanpost-bridge`；`settings` 一条路由合并 GET/PATCH，`sessions` 用 `kind: 'prefix'` + `DELETE /sessions/<key>`；状态响应只投影已知字段。
+9. 保存时 `gatewayUrl` trim；令牌只能替换、不能清空（彻底断开＝停用或删状态文件）。
+10. 主题色使用宿主真实 token：`--dsw-alias-state-{error,success,warn}-primary`、`--dsw-alias-bg-layer-3`、`--dsw-alias-label-primary-foreground`。
+11. `lanpost_find_contact` 截断保守判断：返回 20 条即提示「可能还有更多」（网关无分页总数时的兜底）。
+
+### 15.3 验证结论（2026-11-26）
+
+- 单测：`node --test "test/*.test.ts"` → **216/216 pass**（core 13、store 21、gateway 23、bridge 入站 37、bridge 回复 35、tools 26、routes 25、plugin 12、client 21、audit 6）。
+- 类型/构建：`pnpm run check` 通过；`pnpm run build` 四包全过；三工具输出经宿主 `validateJsonSchemaValue` 实测 10/10 通过。
+- 组合：`DSH_HOME=.dsh-dev node scripts/inject.mjs` → `✓ our-dsh-lanpost-bridge`（our- 行 3 条）。
+- 真实宿主：`dsh web --no-open`（dev profile）启动后**无激活告警**（首轮曾因工具 output schema 使用 `anyOf` 被宿主拒绝，已改 `oneOf`）；`GET /api/lanpost-bridge/{settings,status,workspaces}` 均 200 且形状与设置页契约一致；PATCH 设置成功落盘（0600），`enabled=true` 且无令牌时保持 `idle` 不自旋。
+- **未完成**：lanpost 客户端本机未安装（8443 未监听），真机链路（登录 → 发消息 → 触发会话 → 回发）无法在本轮实测；设置页的浏览器内观感（slot 渲染、深色主题）也未做界面确认。两项列在 §14 M3 的验收清单里，需要 lanpost 客户端在场时补测。
