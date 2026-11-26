@@ -133,6 +133,22 @@ function notify(f: FakeTransport, method: string, params: Record<string, unknown
   f.emit('message', JSON.stringify({ jsonrpc: '2.0', method, params }))
 }
 
+/** 伪造 resume 补发事件信封（结构与网关一致）。 */
+function receivedEnvelope(sequence: number): Record<string, unknown> {
+  return {
+    event_id: `evt_${sequence}`,
+    sequence,
+    method: 'message.received',
+    data: {
+      message_id: `m${sequence}`,
+      conversation_type: 'private',
+      sender: { protocol_id: 'p1', username: 'zhangsan' },
+      content: { type: 'text', text: `补发 ${sequence}` },
+      timestamp: '2026-11-26T02:00:00Z',
+    },
+  }
+}
+
 test('连接后串行握手：login 确认后才 subscribe，再 resume', async () => {
   const f = fakeTransport()
   const gw = makeGateway(f, { lastSequence: 7 })
@@ -589,4 +605,114 @@ test('退避序列 1s 起翻倍、30s 封顶、抖动不越界', () => {
   assert.equal(backoffDelay(9, 1_000, 30_000, () => 1), 30_000)
   // 4409 用第 3 档起步：小基数便于测试验证
   assert.equal(backoffDelay(3, 10, 30_000, half), 80)
+})
+
+test('ACK 在途时收到 -32020：迟到的 ACK 结果被丢弃，重置后仍能继续 ACK', async () => {
+  const f = fakeTransport()
+  const acked: number[] = []
+  const gw = makeGateway(f, { lastSequence: 7, events: { onAck: (sequence: number) => acked.push(sequence) } })
+  gw.start()
+  f.emit('open')
+  await settle()
+  replyTo(f, 'rpc.login', true)
+  await settle()
+  replyTo(f, 'subscribe', true)
+  await settle()
+  assert.equal(resumeFrames(f).at(-1).params.last_sequence, 7)
+
+  // 实时事件 8 处理完，ACK 8 已发出但响应未回
+  notify(f, 'message.received', {
+    event_id: 'evt_8',
+    sequence: 8,
+    data: {
+      message_id: 'm8',
+      conversation_type: 'private',
+      sender: { protocol_id: 'p1', username: 'zhangsan' },
+      content: { type: 'text', text: '实时 8' },
+      timestamp: '2026-11-26T02:00:02Z',
+    },
+  })
+  await settle()
+  assert.equal(ackFrames(f).at(-1).params.sequence, 8)
+
+  // resume(7) 回 -32020：游标重置为 0
+  replyErrorTo(f, 'events.resume', { code: -32020, message: 'EVENT_CURSOR_EXPIRED' })
+  await settle()
+  assert.equal(resumeFrames(f).at(-1).params.last_sequence, 0)
+
+  // 迟到的 ACK 8 成功落地：不得把 lastAcked 复活成 8
+  replyTo(f, 'events.ack', { acked: true })
+  await settle()
+  assert.deepEqual(acked, [])
+  assert.equal(ackFrames(f).length, 1)
+
+  // 第二次 resume(0) 补回 1..8，ACK 从 1 重新连续推进
+  replyTo(f, 'events.resume', {
+    latest_sequence: 8,
+    events: [1, 2, 3, 4, 5, 6, 7, 8].map(receivedEnvelope),
+  })
+  await settle()
+  for (let guard = 0; guard < 20 && acked.length < 8; guard += 1) await ackOk(f)
+  assert.deepEqual(acked, [1, 2, 3, 4, 5, 6, 7, 8])
+  assert.equal(gw.status().state, 'connected')
+
+  // 再来一个实时事件：ACK 必须继续，且带自己的 event_id
+  notify(f, 'message.received', {
+    event_id: 'evt_9',
+    sequence: 9,
+    data: {
+      message_id: 'm9',
+      conversation_type: 'private',
+      sender: { protocol_id: 'p1', username: 'zhangsan' },
+      content: { type: 'text', text: '实时 9' },
+      timestamp: '2026-11-26T02:00:03Z',
+    },
+  })
+  await settle()
+  assert.deepEqual(ackFrames(f).at(-1).params, { event_id: 'evt_9', sequence: 9 })
+  await ackOk(f)
+  assert.deepEqual(acked, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+})
+
+test('重置时在途 ACK 恰好是 lastAcked+1（sequence 1）也会被 epoch 丢弃', async () => {
+  const f = fakeTransport()
+  const acked: number[] = []
+  const gw = makeGateway(f, { lastSequence: 0, events: { onAck: (sequence: number) => acked.push(sequence) } })
+  gw.start()
+  f.emit('open')
+  await settle()
+  replyTo(f, 'rpc.login', true)
+  await settle()
+  replyTo(f, 'subscribe', true)
+  await settle()
+  assert.equal(resumeFrames(f).at(-1).params.last_sequence, 0)
+
+  // 实时事件 1：ACK 1 在途
+  notify(f, 'message.received', {
+    event_id: 'evt_1',
+    sequence: 1,
+    data: {
+      message_id: 'm1',
+      conversation_type: 'private',
+      sender: { protocol_id: 'p1', username: 'zhangsan' },
+      content: { type: 'text', text: '实时 1' },
+      timestamp: '2026-11-26T02:00:00Z',
+    },
+  })
+  await settle()
+  assert.equal(ackFrames(f).at(-1).params.sequence, 1)
+
+  // resume(0) 回 -32020 → 重置；此时迟到的 ACK 1 若被接受，序号校验也拦不住（1 === lastAcked+1）
+  replyErrorTo(f, 'events.resume', { code: -32020, message: 'EVENT_CURSOR_EXPIRED' })
+  await settle()
+  assert.equal(resumeFrames(f).at(-1).params.last_sequence, 0)
+  replyTo(f, 'events.ack', { acked: true })
+  await settle()
+  assert.deepEqual(acked, [])
+
+  replyTo(f, 'events.resume', { latest_sequence: 2, events: [1, 2].map(receivedEnvelope) })
+  await settle()
+  for (let guard = 0; guard < 10 && acked.length < 2; guard += 1) await ackOk(f)
+  assert.deepEqual(acked, [1, 2])
+  assert.equal(gw.status().state, 'connected')
 })

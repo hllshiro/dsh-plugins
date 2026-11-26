@@ -215,6 +215,8 @@ export class LanpostGateway {
   /** 已接收但尚未确认的 event_id（连续区间 lastAcked+1 .. lastReceived）。 */
   private readonly ackBacklog = new Map<number, string>()
   private ackChain: Promise<void> = Promise.resolve()
+  /** 游标代次：resetCursor / confirmUpTo 会让在途 ACK 的结果失效，防止复活/回退 lastAcked。 */
+  private ackEpoch = 0
 
   private nextRequestId = 1
   private readonly pending = new Map<number, PendingCall>()
@@ -340,7 +342,8 @@ export class LanpostGateway {
       return
     }
     if (sequence <= this.lastAcked) return
-    if (sequence > this.lastReceived && !this.ackBacklog.has(sequence)) {
+    // 重置/清空后重投的事件也要能重新带回 event_id；已在 backlog 的不覆盖。
+    if (!this.ackBacklog.has(sequence)) {
       this.ackBacklog.set(sequence, eventId ?? '')
       while (this.ackBacklog.has(this.lastReceived + 1)) this.lastReceived += 1
     }
@@ -370,6 +373,7 @@ export class LanpostGateway {
     while (!this.stopped && this.socket !== null && this.lastAcked < this.lastReceived) {
       const sequence = this.lastAcked + 1
       const eventId = this.ackBacklog.get(sequence) ?? ''
+      const epoch = this.ackEpoch
       let acked = false
       try {
         const result = await this.call<unknown>(
@@ -381,9 +385,18 @@ export class LanpostGateway {
       } catch (error) {
         this.log(`ACK 失败（sequence ${sequence}）：${describe(error)}`)
       }
+      if (epoch !== this.ackEpoch) {
+        // 游标被重置/前移：这是迟到的结果，丢弃；backlog 留待按序重发（ACK 幂等）。
+        this.log(`ACK 结果已过期（sequence ${sequence}），丢弃并保留待重发`)
+        return
+      }
       if (!acked) {
         // 保留 event_id，下次连接先按序重发；ACK 幂等。
         this.log(`ACK 未被确认（sequence ${sequence}），保留待重发`)
+        return
+      }
+      if (sequence !== this.lastAcked + 1) {
+        this.log(`ACK 结果序号不符（sequence ${sequence}），保留待重发`)
         return
       }
       this.ackBacklog.delete(sequence)
@@ -479,6 +492,7 @@ export class LanpostGateway {
     this.lastAcked = 0
     this.lastReceived = 0
     this.ackBacklog.clear()
+    this.ackEpoch += 1
     this.notice = `事件游标不连续（${reason}），已重置为 0 并在本次连接重新 resume；可能缺历史事件`
     this.log(this.notice)
   }
@@ -486,8 +500,11 @@ export class LanpostGateway {
   /** 空 events 表示没有待补事件：把游标推进到网关确认的 latest_sequence。 */
   private confirmUpTo(latest: number): void {
     if (latest <= this.lastAcked) return
-    if (latest > this.lastReceived) this.lastReceived = latest
+    // 实时事件已越过 resume 返回的 latest：不能清 backlog，否则这些事件的 event_id 会丢。
+    if (latest < this.lastReceived) return
+    this.lastReceived = latest
     this.ackBacklog.clear()
+    this.ackEpoch += 1
     this.lastAcked = latest
     this.emitAck(latest)
   }
