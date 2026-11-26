@@ -13,7 +13,7 @@ import type { BridgeState } from '../src/store.ts'
 import type { ToolDefinitionLike, WebRouteLike } from '../src/harness.ts'
 import { RECONNECT, SESSIONS, SETTINGS, STATUS, WORKSPACES } from '../src/routes.ts'
 
-const TOOL_NAMES = ['lanpost_bridge_status', 'lanpost_find_contact', 'lanpost_send_message']
+const TOOL_NAMES = ['lanpost_bridge_status', 'lanpost_list_contacts', 'lanpost_send_message']
 
 /** 一条已注册的提示段（只取断言需要的字段）。 */
 interface RegisteredSection {
@@ -282,7 +282,7 @@ test('装配：3 个工具、5 条路由、1 段提示；未配置时不启网�
     assert.equal(fake.sections[0].name, 'lanpost-bridge')
     assert.equal(fake.sections[0].order, 900)
     assert.match(fake.sections[0].text, /lanpost_send_message/)
-    assert.match(fake.sections[0].text, /lanpost_find_contact/)
+    assert.match(fake.sections[0].text, /lanpost_list_contacts/)
 
     assert.equal(startedCount(fake.logs), 0)
     assert.ok(fake.logs.some((line) => line.includes('gateway skipped')))

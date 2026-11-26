@@ -34,8 +34,9 @@ export interface ToolsDeps {
   state?(): ToolsStateSummary
 }
 
-/** 联系人结果上限（与 users.list 的 page_size 一致）。 */
-const CONTACT_LIMIT = 20
+/** `users.list` 的分页默认值与上限（网关允许 page_size ≤ 200）。 */
+const LIST_PAGE_SIZE_DEFAULT = 50
+const LIST_PAGE_SIZE_MAX = 200
 /** users.list 的超时与网关约定一致（10s）。 */
 const USERS_TIMEOUT_MS = 10_000
 /** 本地参数错误代码；数字代码保留给网关 JSON-RPC 错误。 */
@@ -64,9 +65,12 @@ interface Contact {
   last_seen_at: string | null
 }
 
-interface FindSuccess {
+interface ListSuccess {
   ok: true
   contacts: Contact[]
+  total: number | null
+  page: number
+  page_size: number
   truncated: boolean
 }
 
@@ -95,9 +99,11 @@ interface SendArgs {
   content: string
 }
 
-interface FindArgs {
-  keyword: string
+interface ListArgs {
+  keyword: string | undefined
   onlineOnly: boolean
+  page: number
+  pageSize: number
 }
 
 type Validated<T> = { ok: true; value: T } | ToolFailure
@@ -321,24 +327,32 @@ function renderSend(args: unknown, value: unknown): Array<{ type: 'text'; text: 
 }
 
 // ---------------------------------------------------------------------------
-// lanpost_find_contact
+// lanpost_list_contacts
 
-const FIND_KEYS = ['keyword', 'online_only'] as const
+const LIST_KEYS = ['keyword', 'online_only', 'page', 'page_size'] as const
 
-const FIND_PARAMETERS: Record<string, unknown> = {
+const LIST_PARAMETERS: Record<string, unknown> = {
   type: 'object',
   properties: {
     keyword: {
       type: 'string',
       description:
-        '联系人关键字；匹配 username、display_name 或 protocol_id（具体规则由网关决定）',
+        '可选过滤词；匹配 username、display_name 或 protocol_id（具体规则由网关决定）。省略或空串表示不过滤，列出全部联系人',
     },
     online_only: {
       type: 'boolean',
       description: 'true 时只返回在线联系人',
     },
+    page: {
+      type: 'integer',
+      description: '页码，从 1 开始；默认 1',
+    },
+    page_size: {
+      type: 'integer',
+      description: '每页条数，1–200；默认 50。联系人很多时按页继续取',
+    },
   },
-  required: ['keyword'],
+  required: [],
   additionalProperties: false,
 }
 
@@ -358,16 +372,22 @@ const CONTACT_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
 }
 
-const FIND_OUTPUT_SCHEMA: Record<string, unknown> = {
+const LIST_OUTPUT_SCHEMA: Record<string, unknown> = {
   type: 'object',
   properties: {
     ok: { type: 'boolean' },
     contacts: {
       type: 'array',
       items: CONTACT_SCHEMA,
-      description: '最多 20 个匹配联系人',
+      description: '本页联系人；无 keyword 时即名册的一页',
     },
-    truncated: { type: 'boolean', description: '是否还有更多匹配结果未返回' },
+    total: {
+      oneOf: [{ type: 'integer' }, { type: 'null' }],
+      description: '网关给出的联系人总数；网关未返回时为 null',
+    },
+    page: { type: 'integer', description: '本次请求的页码' },
+    page_size: { type: 'integer', description: '本次请求的每页条数' },
+    truncated: { type: 'boolean', description: '是否还有后续页' },
     error: { type: 'string' },
     code: {
       oneOf: [{ type: 'number' }, { type: 'string' }],
@@ -378,25 +398,44 @@ const FIND_OUTPUT_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
 }
 
-function validateFindArgs(args: unknown): Validated<FindArgs> {
+function validateListArgs(args: unknown): Validated<ListArgs> {
   if (!isRecord(args)) {
-    return failure('参数必须是对象：keyword（联系人关键字），可选 online_only')
+    return failure('参数必须是对象：可选 keyword、online_only、page、page_size')
   }
-  const extra = unknownKey(args, FIND_KEYS)
+  const extra = unknownKey(args, LIST_KEYS)
   if (extra !== undefined) {
-    return failure(`未知参数：${extra}；lanpost_find_contact 只接受 keyword、online_only`)
+    return failure(`未知参数：${extra}；lanpost_list_contacts 只接受 keyword、online_only、page、page_size`)
   }
   const keyword = args.keyword
-  if (typeof keyword !== 'string') {
-    return failure('参数 keyword 必须是字符串')
+  if (keyword !== undefined && typeof keyword !== 'string') {
+    return failure('参数 keyword 必须是字符串；省略或空串表示不过滤')
   }
-  if (keyword.trim() === '') {
-    return failure('keyword 不能为空；请提供姓名、用户名或 protocol_id 的一部分')
-  }
+  const trimmed = typeof keyword === 'string' ? keyword.trim() : ''
   if (args.online_only !== undefined && typeof args.online_only !== 'boolean') {
     return failure('参数 online_only 必须是布尔值')
   }
-  return { ok: true, value: { keyword, onlineOnly: args.online_only === true } }
+  const page = args.page === undefined ? 1 : args.page
+  if (typeof page !== 'number' || !Number.isInteger(page) || page < 1) {
+    return failure('参数 page 必须是 ≥1 的整数')
+  }
+  const pageSize = args.page_size === undefined ? LIST_PAGE_SIZE_DEFAULT : args.page_size
+  if (
+    typeof pageSize !== 'number' ||
+    !Number.isInteger(pageSize) ||
+    pageSize < 1 ||
+    pageSize > LIST_PAGE_SIZE_MAX
+  ) {
+    return failure(`参数 page_size 必须是 1–${LIST_PAGE_SIZE_MAX} 的整数`)
+  }
+  return {
+    ok: true,
+    value: {
+      keyword: trimmed === '' ? undefined : trimmed,
+      onlineOnly: args.online_only === true,
+      page,
+      pageSize,
+    },
+  }
 }
 
 function projectContact(value: unknown): Contact {
@@ -412,28 +451,28 @@ function projectContact(value: unknown): Contact {
 }
 
 /**
- * 判断 users.list 是否还有下一页：total / has_more 是网关明确给出的分页信号，优先采用；
- * 两者都缺失时只能保守判断——正好拿满 `CONTACT_LIMIT` 条就认为可能还有更多，
+ * 判断 users.list 是否还有下一页：优先使用网关给出的 `total`（`page * page_size < total`）；
+ * 网关未给 total 时只能保守判断——本页取满 `page_size` 条就提示「可能还有更多」，
  * 因为不知道网关是否按 page_size 截断（宁可多提示一句，也不要漏掉联系人）。
  */
-function hasNextPage(raw: Record<string, unknown>, shown: number): boolean {
-  if (typeof raw.total === 'number') return raw.total > shown
+function hasNextPage(raw: Record<string, unknown>, shown: number, page: ListArgs): boolean {
+  if (typeof raw.total === 'number') return page.page * page.pageSize < raw.total
   if (typeof raw.has_more === 'boolean') return raw.has_more
-  return shown >= CONTACT_LIMIT
+  return shown >= page.pageSize
 }
 
-async function executeFind(deps: ToolsDeps, args: unknown): Promise<unknown> {
-  const parsed = validateFindArgs(args)
+async function executeList(deps: ToolsDeps, args: unknown): Promise<unknown> {
+  const parsed = validateListArgs(args)
   if (!parsed.ok) return parsed
 
   const gateway = deps.gateway()
   if (gateway === undefined) return notConnected()
 
   const params: Record<string, unknown> = {
-    keyword: parsed.value.keyword,
-    page: 1,
-    page_size: CONTACT_LIMIT,
+    page: parsed.value.page,
+    page_size: parsed.value.pageSize,
   }
+  if (parsed.value.keyword !== undefined) params.keyword = parsed.value.keyword
   if (parsed.value.onlineOnly) params.online = true
 
   try {
@@ -441,12 +480,14 @@ async function executeFind(deps: ToolsDeps, args: unknown): Promise<unknown> {
     if (!isRecord(raw) || !Array.isArray(raw.users)) {
       return failure('users.list 返回格式异常：缺少 users 数组', BAD_RESPONSE)
     }
-    const users = raw.users
-    const contacts = users.slice(0, CONTACT_LIMIT).map(projectContact)
-    const value: FindSuccess = {
+    const contacts = raw.users.slice(0, parsed.value.pageSize).map(projectContact)
+    const value: ListSuccess = {
       ok: true,
       contacts,
-      truncated: hasNextPage(raw, contacts.length),
+      total: typeof raw.total === 'number' ? raw.total : null,
+      page: parsed.value.page,
+      page_size: parsed.value.pageSize,
+      truncated: hasNextPage(raw, contacts.length, parsed.value),
     }
     return value
   } catch (error) {
@@ -455,7 +496,7 @@ async function executeFind(deps: ToolsDeps, args: unknown): Promise<unknown> {
   }
 }
 
-function renderFind(args: unknown, value: unknown): Array<{ type: 'text'; text: string }> {
+function renderList(args: unknown, value: unknown): Array<{ type: 'text'; text: string }> {
   const record = isRecord(args) ? args : {}
   const keyword = oneLine(record.keyword)
 
@@ -464,19 +505,25 @@ function renderFind(args: unknown, value: unknown): Array<{ type: 'text'; text: 
     return [
       {
         type: 'text',
-        text: `查找联系人失败：${oneLine(failed.error)}\n${codeLabel(failed.code)}`,
+        text: `列出联系人失败：${oneLine(failed.error)}\n${codeLabel(failed.code)}`,
       },
     ]
   }
 
-  const found = value as FindSuccess
-  if (found.contacts.length === 0) {
+  const listed = value as ListSuccess
+  const scope = keyword === '' ? '联系人名册' : `匹配「${keyword}」的联系人`
+  const range =
+    listed.total === null
+      ? `第 ${listed.page} 页（每页 ${listed.page_size} 条）`
+      : `第 ${listed.page} 页（共 ${listed.total} 个）`
+  if (listed.contacts.length === 0) {
     const onlineHint =
       record.online_only === true ? '当前只查在线联系人，可去掉 online_only 再试。' : ''
-    return [{ type: 'text', text: `没有找到匹配「${keyword}」的联系人。${onlineHint}` }]
+    const pageHint = listed.page > 1 ? `本页为空；当前${range}，可回到第 1 页查看。` : ''
+    return [{ type: 'text', text: `${pageHint}没有找到${scope}。${onlineHint}` }]
   }
 
-  const lines = found.contacts.map((contact) => {
+  const lines = listed.contacts.map((contact) => {
     const name =
       contact.display_name === contact.username
         ? oneLine(contact.display_name)
@@ -486,9 +533,9 @@ function renderFind(args: unknown, value: unknown): Array<{ type: 'text'; text: 
       contact.last_seen_at === null ? '' : ` · 最近在线 ${oneLine(contact.last_seen_at)}`
     return `- ${name} · protocol_id: ${oneLine(contact.protocol_id)} · ${state}${lastSeen}`
   })
-  const header = `找到 ${found.contacts.length} 个联系人${found.truncated ? '（可能还有更多）' : ''}：`
-  const footer = found.truncated
-    ? `\n只显示前 ${CONTACT_LIMIT} 条，可能还有更多；请用更精确的 keyword 或 online_only 缩小范围。`
+  const header = `${scope}：本页 ${listed.contacts.length} 个，${range}`
+  const footer = listed.truncated
+    ? `\n可能还有更多；用 page=${listed.page + 1} 继续，或加 keyword / online_only 缩小范围。`
     : ''
   return [{ type: 'text', text: `${header}\n${lines.join('\n')}${footer}` }]
 }
@@ -626,18 +673,18 @@ export function createTools(deps: ToolsDeps): ToolDefinitionLike[] {
     {
       name: 'lanpost_send_message',
       description:
-        '当用户要求通过 lanpost-im 给某人或某个群发消息时使用。私聊用 target=user 并提供接收人的 protocol_id（可先用 lanpost_find_contact 查）；群聊用 target=group 并提供 group_id——group_id 不能从 lanpost_find_contact 获得，只能来自入站群消息的来源行或用户直接提供。content 是消息正文，UTF-8 不超过 16 KiB（16384 字节）。消息直接交给网关发送，不排队也不自动重试；未连接或发送失败时返回 ok=false 与原因。',
+        '当用户要求通过 lanpost-im 给某人或某个群发消息时使用。私聊用 target=user 并提供接收人的 protocol_id（可先用 lanpost_list_contacts 查）；群聊用 target=group 并提供 group_id——group_id 不能从 lanpost_list_contacts 获得，只能来自入站群消息的来源行或用户直接提供。content 是消息正文，UTF-8 不超过 16 KiB（16384 字节）。消息直接交给网关发送，不排队也不自动重试；未连接或发送失败时返回 ok=false 与原因。',
       parameters: SEND_PARAMETERS,
       output: { schema: SEND_OUTPUT_SCHEMA, render: renderSend },
       execute: (args, _exec) => executeSend(deps, args),
     },
     {
-      name: 'lanpost_find_contact',
+      name: 'lanpost_list_contacts',
       description:
-        '按关键字查找 lanpost-im 联系人，用于在发消息前确认 protocol_id。匹配 username、display_name 或 protocol_id（具体规则由网关决定），最多返回 20 条并标注是否截断；online_only=true 时只查在线联系人。',
-      parameters: FIND_PARAMETERS,
-      output: { schema: FIND_OUTPUT_SCHEMA, render: renderFind },
-      execute: (args, _exec) => executeFind(deps, args),
+        '列出本机 lanpost-im 联系人名册（可按关键字/在线状态过滤并分页），发消息前用它拿 protocol_id。keyword 省略或空串时列出全部联系人；关键字的匹配规则由网关决定（username、display_name 或 protocol_id）。page 从 1 开始，page_size 默认 50、上限 200；结果会说明本页数量、总数与是否还有后续页。',
+      parameters: LIST_PARAMETERS,
+      output: { schema: LIST_OUTPUT_SCHEMA, render: renderList },
+      execute: (args, _exec) => executeList(deps, args),
     },
     {
       name: 'lanpost_bridge_status',

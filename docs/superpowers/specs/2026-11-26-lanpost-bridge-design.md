@@ -148,7 +148,7 @@ packages/lanpost-bridge/
 | 工具 | 参数 | 行为 |
 | --- | --- | --- |
 | `lanpost_send_message` | `target: 'user'\|'group'`、`id`、`text`（≤16KiB） | 调 `message.sendUser` / `message.sendGroup`；返回 `{message_id, delivery_status}`；未连接直接报错（不排队）。 |
-| `lanpost_find_contact` | `keyword`、`online_only?` | `users.list`，返回最多 20 个 `{protocol_id, username, display_name, online, last_seen_at}`，标注截断。 |
+| `lanpost_list_contacts` | `keyword?`、`online_only?`、`page?`、`page_size?`（默认 50，上限 200） | `users.list`，返回本页 `{protocol_id, username, display_name, online, last_seen_at}` 与网关 `total`；`truncated` 按 `page*page_size < total` 判断，缺 `total` 时本页取满即提示可能还有更多。 |
 | `lanpost_bridge_status` | — | 连接状态、上次错误、映射数量、游标；只读，用于排查。 |
 
 工具描述写「做什么/什么时候用」，参数规则写在参数 `description` 里；返回值带显式截断标记。工具注册不受连接状态影响（未连接时调用给出明确错误）。
@@ -242,7 +242,7 @@ packages/lanpost-bridge/
 8. 路由前缀 `/api/lanpost-bridge`；`settings` 一条路由合并 GET/PATCH，`sessions` 用 `kind: 'prefix'` + `DELETE /sessions/<key>`；状态响应只投影已知字段。
 9. 保存时地址归一为 `host:port`（非法值 400）；令牌只能替换、不能清空（彻底断开＝停用或删状态文件）。
 10. 主题色使用宿主真实 token：`--dsw-alias-state-{error,success,warn}-primary`、`--dsw-alias-bg-layer-3`、`--dsw-alias-label-primary-foreground`。
-11. `lanpost_find_contact` 截断保守判断：返回 20 条即提示「可能还有更多」（网关无分页总数时的兜底）。
+11. `lanpost_list_contacts` 截断判断：有 `total` 用 `page*page_size < total`；缺 `total` 时本页取满 `page_size` 即提示「可能还有更多」（不臆造总数）。
 
 ### 15.3 验证结论（2026-11-26）
 
@@ -260,3 +260,8 @@ packages/lanpost-bridge/
 - **真实网关探测结论**：`192.168.2.8:9015` 可连、`rpc.login` 返回 `true`、`users.list` 正常；但 `client.subscribe`/`subscribe`/`rpc.subscribe`/`events.subscribe` 等**全部** `-32601 Method not found`（文档里的订阅 API 是参考库的方法，不是线上方法），且登录后不主动推送任何通知帧。「握手失败：Method not found」即由此而来。
 - **做法**：既然网关不提供订阅方法，插件不再尝试 `subscribe`，握手后直接按 `events.resume` 轮询（`POLL_INTERVAL_MS = 3000`，可经 `pollIntervalMs` 覆盖）；空 `events` 推进游标、`-32020` 重置游标、`stop`/`close` 清定时器。`ACK` 之前的同一事件不会重复下发，因此轮询不会重复处理。
 - 真实链路验证：dev profile 启用后 `state: connected`、`lastSequence: 2`（握手后第一轮轮询拉到并 ACK 了两条历史 `message.deliveryStatus`），之后无新事件时游标保持稳定。
+### 15.5 联系人工具对齐 `users.list`（2026-11-26，用户 m02072/m02089 决定）
+
+- **问题**：原 `lanpost_find_contact` 与远端语义不一致——远端 `users.list` 是联系人**名册**（`keyword` 可选、`page`、`page_size` ≤200、返回 `total`），而工具要求 `keyword` 必填、固定 `page=1`/`page_size=20`、`truncated` 靠猜测，导致列不出全量、超过 20 条无法继续，名字也误导模型把它当搜索器。
+- **决定**：方案 B（用户 m02089）——工具改名 `lanpost_list_contacts`，`keyword` 可选（省略/空串=不过滤），新增 `page`（1 基）与 `page_size`（默认 50、上限 200）；输出带 `total`/`page`/`page_size`；`truncated` 优先用 `page*page_size < total`，缺 `total` 时本页取满即提示「可能还有更多」。`lanpost_send_message` 描述与系统提示段同步改引用。
+- **验证**：包测试 225/225、`pnpm run check`、`pnpm run build` 通过；注入校验与真实宿主调用待本轮收尾一并执行。

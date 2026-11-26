@@ -55,8 +55,8 @@ pnpm run inject                                            # 构建 + 注入 + �
 
 | 工具 | 用途 |
 | --- | --- |
-| `lanpost_send_message` | 给联系人（`protocol_id`）或群（`group_id`）发文本。要先 `lanpost_find_contact` 拿 `protocol_id`；`group_id` 只能来自入站消息或用户提供。 |
-| `lanpost_find_contact` | 按关键词查在线/离线联系人，返回 `protocol_id`、用户名、主机名、在线状态。 |
+| `lanpost_send_message` | 给联系人（`protocol_id`）或群（`group_id`）发文本。要先 `lanpost_list_contacts` 拿 `protocol_id`；`group_id` 只能来自入站消息或用户提供。 |
+| `lanpost_list_contacts` | 列出联系人名册（可按关键词/在线过滤并分页），返回 `protocol_id`、用户名、显示名、在线状态；`keyword` 省略即全量，`page_size` 默认 50、上限 200。 |
 | `lanpost_bridge_status` | 查桥的连接状态、最近错误、当前映射，用于排查「为什么消息没到」。 |
 
 工具的失败统一返回 `{ok:false,error,code}`，不抛异常；文本上限 16 KiB（UTF-8），超限在本地就拒绝（`-32013` 是网关侧同类错误）。
@@ -110,9 +110,9 @@ pnpm run check                                     # 仓库根 tsc --noEmit
 
 ### 更多边界行为
 
-- `lanpost_find_contact` 返回 20 条即视为「可能被截断」：网关协议没有分页总数时不再继续判断，工具会明说只显示前 20 条。
+- `lanpost_list_contacts` 优先用网关的 `total` 判断后续页；网关没给 `total` 时，本页取满 `page_size` 就提示「可能还有更多」，不臆造总数。
 - 被队列回绝（「我这边还排着 20 条消息」）的那条事件已经进入去重窗口：网关用同一 `event_id` 重投也不会再处理。
-- 群 `group_id` 只出现在入站来源行 `[lanpost 群 <groupId> · 显示名 (@username)]` 里；`lanpost_find_contact` 查不到群。
+- 群 `group_id` 只出现在入站来源行 `[lanpost 群 <groupId> · 显示名 (@username)]` 里；`lanpost_list_contacts` 只列联系人，不列群。
 - 来源行与群名会净化（控制字符、`[`/`]`、换行折叠为空格，零宽连接符保留），显示可能与对方原文略有差异。
 - `status.sessions` 可能是「未知」（`null`，刚重连还没拉到映射表）；`{}` 才表示确实没有映射。
 - 设置页的每个宿主请求 15 秒超时；超时只影响页面读写反馈，不影响后台网关连接与消息收发。

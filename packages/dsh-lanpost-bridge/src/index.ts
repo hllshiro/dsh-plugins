@@ -39,7 +39,7 @@ export const inject = [
  * 模型可见的提示段：只讲「什么时候用哪个工具」。
  * 静态常量，不拼运行时状态，避免每轮提示词变化导致 KV Cache 失效。
  */
-const LANPOST_PROMPT = `当用户要求通过 lanpost（局域网 IM）发消息、找联系人或查看桥接状态时，先调用 lanpost_find_contact 拿到对方的 protocol_id，再用 lanpost_send_message 发送；要确认桥接是否启用、网关连接状态或会话映射时调用 lanpost_bridge_status。消息会原样投递到对端聊天，发送前确认正文完整。工具返回 ok=false 时，把 error 告知用户并按 code 排查，不要重复重试。`
+const LANPOST_PROMPT = `当用户要求通过 lanpost（局域网 IM）发消息、找联系人或查看桥接状态时，先调用 lanpost_list_contacts 拿到对方的 protocol_id（可省略 keyword 列出全部，或用分页取更多），再用 lanpost_send_message 发送；要确认桥接是否启用、网关连接状态或会话映射时调用 lanpost_bridge_status。消息会原样投递到对端聊天，发送前确认正文完整。工具返回 ok=false 时，把 error 告知用户并按 code 排查，不要重复重试。`
 
 /**
  * 装配插件。所有注册都经 `ctx.effect()` 记账，卸载时按 LIFO 回卷；

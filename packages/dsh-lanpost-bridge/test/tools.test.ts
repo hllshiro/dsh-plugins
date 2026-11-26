@@ -87,9 +87,12 @@ interface Contact {
   last_seen_at: string | null
 }
 
-interface FindSuccess {
+interface ListSuccess {
   ok: true
   contacts: Contact[]
+  total: number | null
+  page: number
+  page_size: number
   truncated: boolean
 }
 
@@ -148,7 +151,7 @@ test('createTools 按顺序暴露三个工具，parameters/output 都是自包�
   const tools = allTools()
   assert.deepEqual(
     tools.map((tool) => tool.name),
-    ['lanpost_send_message', 'lanpost_find_contact', 'lanpost_bridge_status'],
+    ['lanpost_send_message', 'lanpost_list_contacts', 'lanpost_bridge_status'],
   )
   for (const tool of tools) {
     assert.equal(typeof tool.description, 'string')
@@ -171,9 +174,12 @@ test('createTools 按顺序暴露三个工具，parameters/output 都是自包�
   assert.ok('group_id' in sendProperties)
   assert.ok('content' in sendProperties)
 
-  const find = toolNamed(tools, 'lanpost_find_contact')
-  assert.match(find.description, /20/)
-  assert.deepEqual(find.parameters.required, ['keyword'])
+  const list = toolNamed(tools, 'lanpost_list_contacts')
+  assert.match(list.description, /protocol_id/)
+  assert.match(list.description, /page_size/)
+  assert.deepEqual(list.parameters.required, [])
+  const listProperties = asRecord(list.parameters.properties)
+  assert.deepEqual(Object.keys(listProperties).sort(), ['keyword', 'online_only', 'page', 'page_size'])
 
   const status = toolNamed(tools, 'lanpost_bridge_status')
   assert.match(status.description, /令牌/)
@@ -339,20 +345,23 @@ test('非 GatewayError 的异常不被吞掉', async () => {
   )
 })
 
-test('find_contact 调 users.list（page_size 20/10s 超时）并投影前 20 条、标注截断', async () => {
+test('list_contacts 调 users.list（默认 page_size 50/10s 超时）并投影整页', async () => {
   const { gateway, calls } = makeGateway({ call: async () => usersPayload() })
-  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_find_contact')
+  const list = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_contacts')
   const args = { keyword: 'u' }
 
-  const value = (await find.execute(args, {})) as FindSuccess
+  const value = (await list.execute(args, {})) as ListSuccess
 
   assert.equal(value.ok, true)
-  assert.equal(value.contacts.length, 20)
-  assert.equal(value.truncated, true)
+  assert.equal(value.contacts.length, 30)
+  assert.equal(value.page, 1)
+  assert.equal(value.page_size, 50)
+  assert.equal(value.total, null)
+  assert.equal(value.truncated, false)
   assert.deepEqual(calls.call, [
     {
       method: 'users.list',
-      params: { keyword: 'u', page: 1, page_size: 20 },
+      params: { keyword: 'u', page: 1, page_size: 50 },
       timeoutMs: 10_000,
     },
   ])
@@ -363,68 +372,88 @@ test('find_contact 调 users.list（page_size 20/10s 超时）并投影前 20 �
     online: true,
     last_seen_at: '2026-01-01T00:00:00Z',
   })
-  assert.deepEqual(value.contacts[19], {
-    protocol_id: 'p19',
-    username: 'u19',
-    display_name: 'U19',
+  assert.deepEqual(value.contacts[29], {
+    protocol_id: 'p29',
+    username: 'u29',
+    display_name: 'U29',
     online: false,
-    last_seen_at: '2026-01-01T00:00:19Z',
+    last_seen_at: '2026-01-01T00:00:29Z',
   })
   assert.equal('hostname' in asRecord(value.contacts[0]), false)
 
-  const text = firstText(find, args, value)
+  const text = firstText(list, args, value)
   assert.match(text, /U0/)
   assert.match(text, /u0/)
   assert.match(text, /p0/)
-  assert.match(text, /截断|前 20 条/)
+  assert.match(text, /本页 30 个/)
 })
 
-test('find_contact 的 online_only=true 会带给网关，false/缺省不带', async () => {
+test('list_contacts 省略或空白 keyword 表示不过滤，page/page_size 原样透传', async () => {
+  const { gateway, calls } = makeGateway({ call: async () => ({ users: [], total: 0 }) })
+  const list = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_contacts')
+
+  await list.execute({}, {})
+  assert.deepEqual(calls.call[0].params, { page: 1, page_size: 50 })
+
+  await list.execute({ keyword: '  ', page: 2, page_size: 200 }, {})
+  assert.deepEqual(calls.call[1].params, { page: 2, page_size: 200 })
+})
+
+test('list_contacts 的 online_only=true 会带给网关，false/缺省不带', async () => {
   const withOnline = makeGateway({ call: async () => ({ users: [] }) })
   const findWithOnline = toolNamed(
     allTools({ gateway: () => withOnline.gateway }),
-    'lanpost_find_contact',
+    'lanpost_list_contacts',
   )
   await findWithOnline.execute({ keyword: '张', online_only: true }, {})
   assert.deepEqual(withOnline.calls.call[0].params, {
     keyword: '张',
     page: 1,
-    page_size: 20,
+    page_size: 50,
     online: true,
   })
 
   const withoutOnline = makeGateway({ call: async () => ({ users: [] }) })
   const findWithoutOnline = toolNamed(
     allTools({ gateway: () => withoutOnline.gateway }),
-    'lanpost_find_contact',
+    'lanpost_list_contacts',
   )
   await findWithoutOnline.execute({ keyword: '张', online_only: false }, {})
   assert.deepEqual(withoutOnline.calls.call[0].params, {
     keyword: '张',
     page: 1,
-    page_size: 20,
+    page_size: 50,
   })
 })
 
-test('find_contact 空结果返回空数组与 truncated=false，render 可读', async () => {
+test('list_contacts 空结果返回空数组与 truncated=false，render 可读', async () => {
   const { gateway } = makeGateway({ call: async () => ({ users: [] }) })
-  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_find_contact')
+  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_contacts')
   const args = { keyword: 'nobody' }
 
-  const value = (await find.execute(args, {})) as FindSuccess
+  const value = (await find.execute(args, {})) as ListSuccess
 
-  assert.deepEqual(value, { ok: true, contacts: [], truncated: false })
+  assert.deepEqual(value, {
+    ok: true,
+    contacts: [],
+    total: null,
+    page: 1,
+    page_size: 50,
+    truncated: false,
+  })
   assert.match(firstText(find, args, value), /没有找到/)
 })
 
-test('find_contact 参数校验失败返回 ok=false 且不调用网关', async () => {
+test('list_contacts 参数校验失败返回 ok=false 且不调用网关', async () => {
   const { gateway, calls } = makeGateway({ call: async () => usersPayload() })
-  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_find_contact')
+  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_contacts')
   const cases: Array<[string, Record<string, unknown>, RegExp]> = [
-    ['缺 keyword', {}, /keyword/],
-    ['空白 keyword', { keyword: '   ' }, /keyword/],
     ['keyword 非字符串', { keyword: 7 }, /keyword/],
     ['online_only 非布尔', { keyword: 'u', online_only: 'yes' }, /online_only/],
+    ['page 非整数', { page: 1.5 }, /page/],
+    ['page 小于 1', { page: 0 }, /page/],
+    ['page_size 超上限', { page_size: 201 }, /page_size/],
+    ['page_size 非整数', { page_size: '50' }, /page_size/],
     ['未知参数', { keyword: 'u', foo: 1 }, /未知参数.*foo/],
   ]
 
@@ -438,13 +467,13 @@ test('find_contact 参数校验失败返回 ok=false 且不调用网关', async 
   assert.equal(calls.call.length, 0)
 })
 
-test('find_contact 的 GatewayError 也映射成 ok=false', async () => {
+test('list_contacts 的 GatewayError 也映射成 ok=false', async () => {
   const { gateway } = makeGateway({
     call: async () => {
       throw new GatewayError(-32001, '令牌无效')
     },
   })
-  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_find_contact')
+  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_contacts')
   const args = { keyword: 'u' }
 
   const value = (await find.execute(args, {})) as Failure
@@ -453,9 +482,9 @@ test('find_contact 的 GatewayError 也映射成 ok=false', async () => {
   assert.match(firstText(find, args, value), /令牌无效/)
 })
 
-test('find_contact 对异常响应（缺 users 数组）明确报错而非静默空结果', async () => {
+test('list_contacts 对异常响应（缺 users 数组）明确报错而非静默空结果', async () => {
   const { gateway } = makeGateway({ call: async () => ({ unexpected: true }) })
-  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_find_contact')
+  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_contacts')
 
   const value = (await find.execute({ keyword: 'u' }, {})) as Failure
 
@@ -598,15 +627,15 @@ test('本地错误不被标成网关错误码，bad_response 也单独命名', a
   assert.match(notConnectedText, /本地/)
   assert.equal(notConnectedText.includes('网关错误码'), false)
 
-  const find = toolNamed(allTools(), 'lanpost_find_contact')
-  const findArgs = { keyword: '   ' }
-  const invalid = (await find.execute(findArgs, {})) as Failure
-  const invalidText = firstText(find, findArgs, invalid)
+  const list = toolNamed(allTools(), 'lanpost_list_contacts')
+  const listArgs = { page: 0 }
+  const invalid = (await list.execute(listArgs, {})) as Failure
+  const invalidText = firstText(list, listArgs, invalid)
   assert.match(invalidText, /参数错误（本地）/)
   assert.equal(invalidText.includes('网关错误码'), false)
 
   const bad = makeGateway({ call: async () => ({ unexpected: true }) })
-  const badFind = toolNamed(allTools({ gateway: () => bad.gateway }), 'lanpost_find_contact')
+  const badFind = toolNamed(allTools({ gateway: () => bad.gateway }), 'lanpost_list_contacts')
   const badArgs = { keyword: 'u' }
   const badValue = (await badFind.execute(badArgs, {})) as Failure
   const badText = firstText(badFind, badArgs, badValue)
@@ -614,7 +643,7 @@ test('本地错误不被标成网关错误码，bad_response 也单独命名', a
   assert.equal(badText.includes('网关错误码'), false)
 })
 
-test('find_contact 用 total 判断下一页：刚好 20 条不标截断，total 更大才标', async () => {
+test('list_contacts 用 total 判断下一页：刚好一页不标截断，total 更大才标', async () => {
   const users = (count: number) =>
     Array.from({ length: count }, (_, index) => ({
       protocol_id: `p${index}`,
@@ -624,22 +653,22 @@ test('find_contact 用 total 判断下一页：刚好 20 条不标截断，total
       last_seen_at: null,
     }))
 
-  const exact = makeGateway({ call: async () => ({ total: 20, users: users(20) }) })
-  const exactFind = toolNamed(allTools({ gateway: () => exact.gateway }), 'lanpost_find_contact')
-  const exactValue = (await exactFind.execute({ keyword: 'u' }, {})) as FindSuccess
-  assert.equal(exactValue.contacts.length, 20)
+  const exact = makeGateway({ call: async () => ({ total: 50, users: users(50) }) })
+  const exactFind = toolNamed(allTools({ gateway: () => exact.gateway }), 'lanpost_list_contacts')
+  const exactValue = (await exactFind.execute({ keyword: 'u' }, {})) as ListSuccess
+  assert.equal(exactValue.contacts.length, 50)
   assert.equal(exactValue.truncated, false)
 
-  const more = makeGateway({ call: async () => ({ total: 25, users: users(20) }) })
-  const moreFind = toolNamed(allTools({ gateway: () => more.gateway }), 'lanpost_find_contact')
-  const moreValue = (await moreFind.execute({ keyword: 'u' }, {})) as FindSuccess
-  assert.equal(moreValue.contacts.length, 20)
+  const more = makeGateway({ call: async () => ({ total: 75, users: users(50) }) })
+  const moreFind = toolNamed(allTools({ gateway: () => more.gateway }), 'lanpost_list_contacts')
+  const moreValue = (await moreFind.execute({ keyword: 'u' }, {})) as ListSuccess
+  assert.equal(moreValue.contacts.length, 50)
   assert.equal(moreValue.truncated, true)
 })
 
 // 网关不给 total / has_more 时只能保守判断：拿满一页就当「可能还有更多」。
-test('find_contact 恰好 20 条且没有分页信号时保守标注可能还有更多', async () => {
-  const users = Array.from({ length: 20 }, (_, index) => ({
+test('list_contacts 取满一页且没有分页信号时保守标注可能还有更多', async () => {
+  const users = Array.from({ length: 50 }, (_, index) => ({
     protocol_id: `p${index}`,
     username: `u${index}`,
     display_name: `U${index}`,
@@ -647,17 +676,17 @@ test('find_contact 恰好 20 条且没有分页信号时保守标注可能还有
     last_seen_at: null,
   }))
   const { gateway } = makeGateway({ call: async () => ({ users }) })
-  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_find_contact')
+  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_contacts')
   const args = { keyword: 'u' }
-  const value = (await find.execute(args, {})) as FindSuccess
+  const value = (await find.execute(args, {})) as ListSuccess
 
-  assert.equal(value.contacts.length, 20)
+  assert.equal(value.contacts.length, 50)
   assert.equal(value.truncated, true)
-  assert.match(firstText(find, args, value), /只显示前 20 条，可能还有更多/)
+  assert.match(firstText(find, args, value), /可能还有更多/)
 })
 
-test('find_contact 19 条未拿满一页时不标截断', async () => {
-  const users = Array.from({ length: 19 }, (_, index) => ({
+test('list_contacts 49 条未拿满一页时不标截断', async () => {
+  const users = Array.from({ length: 49 }, (_, index) => ({
     protocol_id: `p${index}`,
     username: `u${index}`,
     display_name: `U${index}`,
@@ -665,11 +694,11 @@ test('find_contact 19 条未拿满一页时不标截断', async () => {
     last_seen_at: null,
   }))
   const { gateway } = makeGateway({ call: async () => ({ users }) })
-  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_find_contact')
+  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_contacts')
   const args = { keyword: 'u' }
-  const value = (await find.execute(args, {})) as FindSuccess
+  const value = (await find.execute(args, {})) as ListSuccess
 
-  assert.equal(value.contacts.length, 19)
+  assert.equal(value.contacts.length, 49)
   assert.equal(value.truncated, false)
   assert.equal(firstText(find, args, value).includes('可能还有更多'), false)
 })
@@ -688,9 +717,9 @@ test('render 折叠网关文本里的换行与控制字符', async () => {
       ],
     }),
   })
-  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_find_contact')
+  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_contacts')
   const args = { keyword: 'bad' }
-  const value = (await find.execute(args, {})) as FindSuccess
+  const value = (await find.execute(args, {})) as ListSuccess
   const text = firstText(find, args, value)
 
   assert.equal(text.includes('\u0000'), false)
