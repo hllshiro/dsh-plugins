@@ -16,10 +16,9 @@ export type BridgeStateName = 'idle' | 'connecting' | 'connected' | 'error'
 /** 设置页拿到的公开设置：绝不含令牌原文，只带 tokenSet 标记。 */
 export interface PublicSettings {
   enabled: boolean
-  gatewayUrl: string
+  gatewayAddress: string
   tokenSet: boolean
   workspaceId: string | null
-  workspacePath: string | null
   sessionMode: SessionMode
   showProcess: boolean
   selfProtocolId: string | null
@@ -115,11 +114,9 @@ export function normalizeSettings(raw: unknown): PublicSettings {
   const source = isRecord(outer.settings) ? outer.settings : outer
   return {
     enabled: source.enabled === true,
-    gatewayUrl: typeof source.gatewayUrl === 'string' ? source.gatewayUrl : '',
+    gatewayAddress: typeof source.gatewayAddress === 'string' ? source.gatewayAddress : '',
     tokenSet: source.tokenSet === true,
     workspaceId: typeof source.workspaceId === 'string' && source.workspaceId !== '' ? source.workspaceId : null,
-    workspacePath:
-      typeof source.workspacePath === 'string' && source.workspacePath !== '' ? source.workspacePath : null,
     sessionMode: source.sessionMode === 'new' ? 'new' : 'continue',
     showProcess: source.showProcess === true,
     selfProtocolId:
@@ -259,10 +256,9 @@ export async function deleteSession(key: string): Promise<{ removed: boolean }> 
 /** 设置页表单状态：令牌单独一栏，空串表示不修改。 */
 export interface SettingsForm {
   enabled: boolean
-  gatewayUrl: string
+  gatewayAddress: string
   token: string
   workspaceId: string
-  workspacePath: string
   sessionMode: SessionMode
   showProcess: boolean
   selfProtocolId: string
@@ -271,9 +267,8 @@ export interface SettingsForm {
 /** 提交给宿主 PATCH 的补丁；空令牌时省略 token 键。 */
 export interface SettingsPatch {
   enabled: boolean
-  gatewayUrl: string
+  gatewayAddress: string
   workspaceId: string | null
-  workspacePath: string | null
   sessionMode: SessionMode
   showProcess: boolean
   selfProtocolId: string | null
@@ -289,10 +284,9 @@ function blankToNull(value: string): string | null {
 export function toForm(settings: PublicSettings): SettingsForm {
   return {
     enabled: settings.enabled,
-    gatewayUrl: settings.gatewayUrl,
+    gatewayAddress: settings.gatewayAddress,
     token: '',
     workspaceId: settings.workspaceId ?? '',
-    workspacePath: settings.workspacePath ?? '',
     sessionMode: settings.sessionMode,
     showProcess: settings.showProcess,
     selfProtocolId: settings.selfProtocolId ?? '',
@@ -303,9 +297,8 @@ export function toForm(settings: PublicSettings): SettingsForm {
 export function toPatch(form: SettingsForm): SettingsPatch {
   const patch: SettingsPatch = {
     enabled: form.enabled,
-    gatewayUrl: form.gatewayUrl.trim(),
+    gatewayAddress: form.gatewayAddress.trim(),
     workspaceId: blankToNull(form.workspaceId),
-    workspacePath: blankToNull(form.workspacePath),
     sessionMode: form.sessionMode,
     showProcess: form.showProcess,
     selfProtocolId: blankToNull(form.selfProtocolId),
@@ -316,7 +309,7 @@ export function toPatch(form: SettingsForm): SettingsPatch {
 }
 
 /**
- * 保存成功文案：宿主只在 enabled / gatewayUrl / token 变化时重建网关（src/index.ts），
+ * 保存成功文案：宿主只在 enabled / gatewayAddress / token 变化时重建网关（src/index.ts），
  * 其余设置保存即生效。文案必须与宿主行为一致，不能一律说「已重连」。
  * 客户端拿不到已存令牌（只有 tokenSet），所以只能按「输入了新令牌」给出弱化提示，
  * 不能断言宿主一定会重连（重输相同令牌时宿主按值比较不会重启）。
@@ -324,7 +317,7 @@ export function toPatch(form: SettingsForm): SettingsPatch {
 export function saveSuccessText(previous: SettingsForm, next: SettingsForm): string {
   const restarts =
     previous.enabled !== next.enabled ||
-    previous.gatewayUrl.trim() !== next.gatewayUrl.trim()
+    previous.gatewayAddress.trim() !== next.gatewayAddress.trim()
   if (restarts) return '已保存，网关已按新配置重连。'
   if (next.token.trim() !== '') return '已保存（令牌有变更时会重新连接）。'
   return '已保存。'
@@ -678,10 +671,9 @@ function StatusBanner(props: {
 function formsEqual(a: SettingsForm, b: SettingsForm): boolean {
   return (
     a.enabled === b.enabled &&
-    a.gatewayUrl === b.gatewayUrl &&
+    a.gatewayAddress === b.gatewayAddress &&
     a.token === b.token &&
     a.workspaceId === b.workspaceId &&
-    a.workspacePath === b.workspacePath &&
     a.sessionMode === b.sessionMode &&
     a.showProcess === b.showProcess &&
     a.selfProtocolId === b.selfProtocolId
@@ -895,13 +887,16 @@ function Section(): React.ReactElement {
           h('p', { style: styles.hint }, '启用后按下面的配置连接 lanpost；停用只会断开网关，不会删除配置。'),
           h(
             Field,
-            { label: '网关地址', hint: 'lanpost 网关的 WebSocket 地址。' },
+            {
+              label: '网关地址',
+              hint: '只填 ip:port，例如 localhost:9015；插件自动用 ws:// 连接，不走 TLS。',
+            },
             h('input', {
               type: 'text',
-              value: form.gatewayUrl,
-              placeholder: 'wss://127.0.0.1:8443/ws/dsh',
+              value: form.gatewayAddress,
+              placeholder: 'localhost:9015',
               spellCheck: false,
-              onChange: (event: React.ChangeEvent<HTMLInputElement>) => update({ gatewayUrl: event.target.value }),
+              onChange: (event: React.ChangeEvent<HTMLInputElement>) => update({ gatewayAddress: event.target.value }),
               style: styles.input,
             }),
           ),
@@ -927,8 +922,8 @@ function Section(): React.ReactElement {
               label: '工作区',
               hint:
                 workspaceError === null
-                  ? '留空表示不绑定，新建会话使用 DSH 的默认工作区。'
-                  : `${workspaceError}留空表示不绑定。`,
+                  ? '只列出 DSH 已打开的工作区；不绑定则新建会话用 DSH 默认目录。'
+                  : `${workspaceError}不绑定则使用默认工作区。`,
             },
             h(
               'select',
@@ -954,18 +949,9 @@ function Section(): React.ReactElement {
                 ),
               ),
             ),
-          ),
-          h(
-            Field,
-            { label: '自定义工作区路径（可选）', hint: '直接填写工作区目录；与下拉选择同时填写时以宿主实现为准。' },
-            h('input', {
-              type: 'text',
-              value: form.workspacePath,
-              placeholder: 'D:\\work\\project（可留空）',
-              spellCheck: false,
-              onChange: (event: React.ChangeEvent<HTMLInputElement>) => update({ workspacePath: event.target.value }),
-              style: styles.input,
-            }),
+            workspaces.length === 0 && workspaceError === null
+              ? h('p', { style: styles.hint }, '暂无可用工作区，请先在 DSH 中打开一个项目目录。')
+              : null,
           ),
           h(
             'fieldset',

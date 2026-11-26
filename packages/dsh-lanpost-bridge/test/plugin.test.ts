@@ -296,7 +296,7 @@ test('装配：3 个工具、5 条路由、1 段提示；未配置时不启网�
 test('enabled=false：配置了地址与令牌也不启网关，状态保持 idle', async () => {
   const { handle } = withTempHome({
     enabled: false,
-    gatewayUrl: 'ws://127.0.0.1:1/ws/dsh',
+    gatewayAddress: '127.0.0.1:1',
     token: 'hidden-token',
   })
   try {
@@ -364,10 +364,10 @@ test('卸载后重新 apply 能完整重装配（注册表无残留、无重复�
   }
 })
 
-test('PATCH 设置：非连接字段只落盘；enabled / gatewayUrl / token 变化才重启网关', async () => {
+test('PATCH 设置：非连接字段只落盘；enabled / gatewayAddress / token 变化才重启网关', async () => {
   const { handle, file } = withTempHome({
     enabled: true,
-    gatewayUrl: 'ws://127.0.0.1:1/ws/dsh',
+    gatewayAddress: '127.0.0.1:1',
     token: 'hidden-token',
     sessionMode: 'continue',
   })
@@ -390,7 +390,7 @@ test('PATCH 设置：非连接字段只落盘；enabled / gatewayUrl / token 变
     // 换地址：必须重启网关。
     await call(fake.routes, SETTINGS, {
       method: 'PATCH',
-      body: JSON.stringify({ gatewayUrl: 'ws://127.0.0.1:2/ws/dsh' }),
+      body: JSON.stringify({ gatewayAddress: '127.0.0.1:2' }),
     })
     assert.equal(startedCount(fake.logs), 2)
 
@@ -413,7 +413,7 @@ test('PATCH 落盘失败时回 500，且内存设置保持原值', async () => {
 
     const failed = await call(fake.routes, SETTINGS, {
       method: 'PATCH',
-      body: JSON.stringify({ showProcess: true, gatewayUrl: 'ws://127.0.0.1:2/ws/dsh' }),
+      body: JSON.stringify({ showProcess: true, gatewayAddress: '127.0.0.1:2' }),
     })
     assert.equal(failed.statusCode, 500)
     assert.deepEqual(failed.body, { error: 'internal' })
@@ -421,9 +421,9 @@ test('PATCH 落盘失败时回 500，且内存设置保持原值', async () => {
     // 先落盘再改内存：落盘失败时内存仍是 PATCH 之前的值。
     const status = await call(fake.routes, STATUS, { method: 'GET' })
     assert.equal(status.statusCode, 200)
-    const body = status.body as { settings: { showProcess: boolean; gatewayUrl: string } }
+    const body = status.body as { settings: { showProcess: boolean; gatewayAddress: string } }
     assert.equal(body.settings.showProcess, false)
-    assert.equal(body.settings.gatewayUrl, DEFAULTS.gatewayUrl)
+    assert.equal(body.settings.gatewayAddress, DEFAULTS.gatewayAddress)
     assert.equal(startedCount(fake.logs), 0)
   } finally {
     handle.restore()
@@ -433,7 +433,7 @@ test('PATCH 落盘失败时回 500，且内存设置保持原值', async () => {
 test('PATCH enabled=false 停掉已连接的网关，重连接口对停用配置回 409', async () => {
   const { handle } = withTempHome({
     enabled: true,
-    gatewayUrl: 'ws://127.0.0.1:1/ws/dsh',
+    gatewayAddress: '127.0.0.1:1',
     token: 'hidden-token',
   })
   try {
@@ -492,10 +492,10 @@ test('路由注册中途失败时按顺序尝试注册（回卷由宿主负责�
   }
 })
 
-test('建连前 trim gatewayUrl，日志与网关地址都是去掉首尾空白后的值', () => {
+test('建连前把地址归一为 host:port，日志里是组装后的 ws URL', () => {
   const { handle } = withTempHome({
     enabled: true,
-    gatewayUrl: '  ws://127.0.0.1:1/ws/dsh  ',
+    gatewayAddress: '  ws://127.0.0.1:1/ws/dsh  ',
     token: 'hidden-token',
   })
   try {
@@ -514,7 +514,7 @@ test('建连前 trim gatewayUrl，日志与网关地址都是去掉首尾空白�
 test('停用网关后 status().since 刷新为停止时刻，而不是启动时刻', async () => {
   const { handle } = withTempHome({
     enabled: true,
-    gatewayUrl: 'ws://127.0.0.1:1/ws/dsh',
+    gatewayAddress: '127.0.0.1:1',
     token: 'hidden-token',
   })
   try {

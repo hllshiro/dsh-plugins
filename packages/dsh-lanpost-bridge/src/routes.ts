@@ -3,6 +3,7 @@
 // 请求体与响应体都是 JSON，令牌绝不进入任何响应或审计明细。
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebRouteLike } from './harness.ts'
+import { parseGatewayAddress } from './core.ts'
 import { publicSettings } from './store.ts'
 import type { BridgeState } from './store.ts'
 
@@ -141,16 +142,15 @@ function cleanSettingsPatch(input: Record<string, unknown>): Record<string, unkn
   const patch: Record<string, unknown> = {}
   const enabled = own(input, 'enabled')
   if (typeof enabled === 'boolean') patch.enabled = enabled
-  const gatewayUrl = own(input, 'gatewayUrl')
-  if (typeof gatewayUrl === 'string') patch.gatewayUrl = gatewayUrl
+  const gatewayAddress = own(input, 'gatewayAddress')
+  if (typeof gatewayAddress === 'string') {
+    const address = parseGatewayAddress(gatewayAddress)
+    if (address === null) throw new HttpError(400, 'invalid-address')
+    patch.gatewayAddress = address
+  }
   const workspaceId = own(input, 'workspaceId')
   if (workspaceId === null) patch.workspaceId = null
   else if (typeof workspaceId === 'string') patch.workspaceId = nullIfEmpty(workspaceId)
-  const workspacePath = own(input, 'workspacePath')
-  if (workspacePath === null) patch.workspacePath = null
-  else if (typeof workspacePath === 'string') {
-    patch.workspacePath = nullIfEmpty(workspacePath)
-  }
   const selfProtocolId = own(input, 'selfProtocolId')
   if (typeof selfProtocolId === 'string') {
     patch.selfProtocolId = nullIfEmpty(selfProtocolId)
@@ -256,6 +256,12 @@ export function createRoutes(deps: RouteDeps): WebRouteLike[] {
           return
         }
         const patch = cleanSettingsPatch(await readJsonBody(req))
+        const selected = own(patch, 'workspaceId')
+        if (typeof selected === 'string') {
+          // 工作区只能选 DSH 当前已打开的目录，不再支持手填路径。
+          const known = (await deps.workspaces()).some((workspace) => workspace.id === selected)
+          if (!known) throw new HttpError(400, 'unknown-workspace')
+        }
         if (Object.keys(patch).length > 0) {
           await deps.patch(patch)
           deps.audit?.('settings.patch', { keys: Object.keys(patch).sort() })
@@ -270,7 +276,7 @@ export function createRoutes(deps: RouteDeps): WebRouteLike[] {
       ['POST'],
       async (_req, res) => {
         const state = deps.state()
-        if (!state.enabled || state.gatewayUrl.trim() === '' || state.token === '') {
+        if (!state.enabled || state.gatewayAddress === '' || state.token === '') {
           writeJson(res, 409, { error: 'not-configured' })
           return
         }

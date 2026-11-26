@@ -15,6 +15,35 @@ export const SEEN_LIMIT = 500
 /** 群触发前缀：`/dsh` 后跟空白或字符串结束。 */
 export const GROUP_TRIGGER = /^\/dsh(?:\s+|$)/i
 
+/** 网关默认地址：只填 `host:port`，协议由插件决定。 */
+export const DEFAULT_GATEWAY_ADDRESS = 'localhost:9015'
+/** 网关 WebSocket 路径固定，地址里只配 host:port。 */
+export const GATEWAY_WS_PATH = '/ws/dsh'
+
+const ADDRESS_PATTERN = /^(?:\[[0-9a-fA-F:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):\d{1,5}$/
+
+/**
+ * 归一网关地址：只接受 `host:port`。
+ * 兼容用户粘贴完整 URL 的情况（去掉 `ws://`/`http://` 与路径），非法输入返回 null。
+ */
+export function parseGatewayAddress(input: string): string | null {
+  let text = input.trim()
+  if (text === '') return null
+  const scheme = text.indexOf('://')
+  if (scheme !== -1) text = text.slice(scheme + 3)
+  const slash = text.indexOf('/')
+  if (slash !== -1) text = text.slice(0, slash)
+  if (!ADDRESS_PATTERN.test(text)) return null
+  const port = Number(text.slice(text.lastIndexOf(':') + 1))
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null
+  return text
+}
+
+/** 由 `host:port` 组出 WebSocket URL；局域网明文连接，不使用 TLS。 */
+export function gatewayWsUrl(address: string): string {
+  return `ws://${address}${GATEWAY_WS_PATH}`
+}
+
 /** 消息来源类型：私聊或群聊。 */
 export type SourceKind = 'private' | 'group'
 

@@ -79,7 +79,7 @@ interface StatusConnection {
 
 interface StatusValue {
   enabled: boolean
-  gatewayUrl: string
+  gatewayAddress: string
   connection: StatusConnection
   lastSequence: number | null
   tokenSet: boolean
@@ -507,7 +507,7 @@ const STATUS_OUTPUT_SCHEMA: Record<string, unknown> = {
   type: 'object',
   properties: {
     enabled: { type: 'boolean', description: '桥接是否启用' },
-    gatewayUrl: { type: 'string', description: '网关地址' },
+    gatewayAddress: { type: 'string', description: '网关地址（host:port）' },
     connection: {
       type: 'object',
       properties: {
@@ -544,7 +544,7 @@ const STATUS_OUTPUT_SCHEMA: Record<string, unknown> = {
   },
   required: [
     'enabled',
-    'gatewayUrl',
+    'gatewayAddress',
     'connection',
     'lastSequence',
     'tokenSet',
@@ -572,7 +572,7 @@ function buildStatus(deps: ToolsDeps): StatusValue {
   const summary = deps.state?.()
   return {
     enabled: settings.enabled,
-    gatewayUrl: settings.gatewayUrl,
+    gatewayAddress: settings.gatewayAddress,
     connection,
     lastSequence: summary === undefined ? null : summary.lastSequence,
     tokenSet: settings.tokenSet,
@@ -600,7 +600,7 @@ function renderStatus(_args: unknown, value: unknown): Array<{ type: 'text'; tex
   const lines = [
     `lanpost 桥接：${status.enabled ? '已启用' : '未启用'}`,
     `连接：${connection}${since}`,
-    `网关地址：${oneLine(status.gatewayUrl)}`,
+    `网关地址：${oneLine(status.gatewayAddress)}`,
     `令牌：${status.tokenSet ? '已配置' : '未配置'}`,
     `事件游标：${status.lastSequence === null ? '未知' : status.lastSequence}`,
     `映射会话：${status.sessions === null ? '未知' : status.sessions}`,

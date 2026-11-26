@@ -54,10 +54,9 @@ function installFetch(
 
 const SAMPLE_SETTINGS = {
   enabled: true,
-  gatewayUrl: 'wss://127.0.0.1:8443/ws/dsh',
+  gatewayAddress: '127.0.0.1:8443',
   tokenSet: true,
   workspaceId: 'ws-1',
-  workspacePath: '/work/a',
   sessionMode: 'continue' as const,
   showProcess: false,
   selfProtocolId: 'me',
@@ -65,10 +64,9 @@ const SAMPLE_SETTINGS = {
 
 const BLANK_FORM = {
   enabled: false,
-  gatewayUrl: 'wss://127.0.0.1:8443/ws/dsh',
+  gatewayAddress: '127.0.0.1:8443',
   token: '',
   workspaceId: '',
-  workspacePath: '',
   sessionMode: 'new' as const,
   showProcess: true,
   selfProtocolId: '',
@@ -116,10 +114,9 @@ test('fetchSettings：也接受裸 PublicSettings，并为缺失字段补默认�
   installFetch(t, () => ({ body: {} }))
   assert.deepEqual(await client.fetchSettings(), {
     enabled: false,
-    gatewayUrl: '',
+    gatewayAddress: '',
     tokenSet: false,
     workspaceId: null,
-    workspacePath: null,
     sessionMode: 'continue',
     showProcess: false,
     selfProtocolId: null,
@@ -325,18 +322,16 @@ test('deleteSession：DELETE /sessions/:key 且回传宿主是否真的删掉', 
 test('toForm：公开设置转表单，令牌永远留空', () => {
   assert.deepEqual(client.toForm(SAMPLE_SETTINGS), {
     enabled: true,
-    gatewayUrl: 'wss://127.0.0.1:8443/ws/dsh',
+    gatewayAddress: '127.0.0.1:8443',
     token: '',
     workspaceId: 'ws-1',
-    workspacePath: '/work/a',
-    sessionMode: 'continue',
+      sessionMode: 'continue',
     showProcess: false,
     selfProtocolId: 'me',
   })
 
-  assert.deepEqual(client.toForm({ ...SAMPLE_SETTINGS, workspaceId: null, workspacePath: null, selfProtocolId: null }).token, '')
+  assert.equal(client.toForm({ ...SAMPLE_SETTINGS, workspaceId: null, selfProtocolId: null }).token, '')
   assert.equal(client.toForm({ ...SAMPLE_SETTINGS, workspaceId: null }).workspaceId, '')
-  assert.equal(client.toForm({ ...SAMPLE_SETTINGS, workspacePath: null }).workspacePath, '')
   assert.equal(client.toForm({ ...SAMPLE_SETTINGS, selfProtocolId: null }).selfProtocolId, '')
 })
 
@@ -344,9 +339,8 @@ test('toPatch：空令牌不提交，空工作区/路径/身份转 null', () => 
   const patch = client.toPatch(BLANK_FORM)
   assert.deepEqual(patch, {
     enabled: false,
-    gatewayUrl: 'wss://127.0.0.1:8443/ws/dsh',
+    gatewayAddress: '127.0.0.1:8443',
     workspaceId: null,
-    workspacePath: null,
     sessionMode: 'new',
     showProcess: true,
     selfProtocolId: null,
@@ -362,14 +356,12 @@ test('toPatch：去空白并保留非空令牌', () => {
     ...BLANK_FORM,
     token: '  tok-1  ',
     workspaceId: ' w1 ',
-    workspacePath: ' /p ',
     selfProtocolId: ' me ',
   })
   assert.deepEqual(patch, {
     enabled: false,
-    gatewayUrl: 'wss://127.0.0.1:8443/ws/dsh',
+    gatewayAddress: '127.0.0.1:8443',
     workspaceId: 'w1',
-    workspacePath: '/p',
     sessionMode: 'new',
     showProcess: true,
     selfProtocolId: 'me',
@@ -377,21 +369,21 @@ test('toPatch：去空白并保留非空令牌', () => {
   })
 })
 
-test('saveSuccessText：enabled/gatewayUrl 变更才断言已重连，令牌只做弱化提示', () => {
+test('saveSuccessText：enabled/gatewayAddress 变更才断言已重连，令牌只做弱化提示', () => {
   const saved = client.toForm(SAMPLE_SETTINGS)
   assert.equal(client.saveSuccessText(saved, saved), '已保存。')
   assert.equal(
-    client.saveSuccessText(saved, { ...saved, showProcess: !saved.showProcess, workspacePath: '/other' }),
+    client.saveSuccessText(saved, { ...saved, showProcess: !saved.showProcess, workspaceId: 'other' }),
     '已保存。',
   )
   assert.equal(client.saveSuccessText(saved, { ...saved, enabled: !saved.enabled }), '已保存，网关已按新配置重连。')
   assert.equal(
-    client.saveSuccessText(saved, { ...saved, gatewayUrl: '  wss://10.0.0.1:8443/ws/dsh  ' }),
+    client.saveSuccessText(saved, { ...saved, gatewayAddress: '  10.0.0.1:8443  ' }),
     '已保存，网关已按新配置重连。',
   )
   // 只差首尾空白：trim 后相同，宿主不会重建网关。
   assert.equal(
-    client.saveSuccessText(saved, { ...saved, gatewayUrl: `  ${saved.gatewayUrl}  ` }),
+    client.saveSuccessText(saved, { ...saved, gatewayAddress: `  ${saved.gatewayAddress}  ` }),
     '已保存。',
   )
   // 客户端只有 tokenSet、拿不到已存令牌，不能断言重输相同令牌一定会重连。

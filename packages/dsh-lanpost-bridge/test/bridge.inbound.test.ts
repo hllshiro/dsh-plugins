@@ -351,14 +351,10 @@ test('重命名失败只记日志，不影响投递', async () => {
   assert.ok(s.logs.some((line) => line.includes('rename denied')))
 })
 
-test('create 请求：workspaceId 优先，其次 workspacePath 作为 cwd，都空则空对象', async () => {
-  const byId = setup({ state: { workspaceId: 'w1', workspacePath: 'D:\\ws' } })
+test('create 请求：选了工作区才传 workspaceId，未选则空对象', async () => {
+  const byId = setup({ state: { workspaceId: 'w1' } })
   await byId.bridge.handleMessage(msg())
   assert.deepEqual(byId.created[0], { workspaceId: 'w1' })
-
-  const byPath = setup({ state: { workspaceId: null, workspacePath: 'D:\\ws' } })
-  await byPath.bridge.handleMessage(msg())
-  assert.deepEqual(byPath.created[0], { cwd: 'D:\\ws' })
 
   const bare = setup()
   await bare.bridge.handleMessage(msg())

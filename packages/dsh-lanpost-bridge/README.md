@@ -4,13 +4,13 @@ DSH ↔ lanpost-im 适配插件：agent 可以用工具给 lanpost 联系人/群
 
 - 包名 `@hllshiro/dsh-lanpost-bridge`，组合行 id `our-dsh-lanpost-bridge`
 - 双面：宿主半 `src/index.ts`，浏览器半 `src/client.ts`（经 `./client` 导出，挂在设置页 `settings.section`）
-- 依赖 lanpost-im 客户端内嵌的 Agent Gateway（WebSocket JSON-RPC，默认 `wss://127.0.0.1:8443/ws/dsh`，自签证书）
+- 依赖 lanpost-im 客户端内嵌的 Agent Gateway（WebSocket JSON-RPC，明文 `ws://`，地址只填 `host:port`，默认 `localhost:9015`）
 
 ## 运行前提
 
 1. lanpost-im 客户端已安装并登录，且在它的设置里开启了 Agent Gateway、生成了访问令牌（43 字符 base64url）。
 2. DSH 侧运行 Node ≥ 22（本仓库开发用 Node 24）；插件宿主半依赖 `ws`（已作为包依赖声明，构建时外置）。
-3. 网关只监听本机回环地址；令牌只落盘到 `$DSH_HOME/dsh-lanpost-bridge.json`（0600），任何 HTTP 响应、工具输出、日志都不回显。
+3. 局域网内明文连接、不启用 TLS；令牌只落盘到 `$DSH_HOME/dsh-lanpost-bridge.json`（0600），任何 HTTP 响应、工具输出、日志都不回显。
 
 ## 安装
 
@@ -33,9 +33,9 @@ pnpm run inject                                            # 构建 + 注入 + �
 | 字段 | 含义 |
 | --- | --- |
 | 启用 | 关闭时断开网关、卸载订阅，工具返回「桥未启用」。 |
-| 网关地址 | 默认 `wss://127.0.0.1:8443/ws/dsh`；lanpost 客户端改过端口时同步改这里。 |
+| 网关地址 | 只填 `ip:port`（如 `192.168.2.8:9015`），默认 `localhost:9015`；插件自动用 `ws://<地址>/ws/dsh` 连接，不走 TLS。粘贴带 `ws://` 或路径的地址会被归一。 |
 | 访问令牌 | 从 lanpost 客户端生成。输入框留空表示不改动已保存的令牌。 |
-| 工作区 / 自定义路径 | 新会话落在哪个目录；下拉来自 DSH 已注册工作区，列表读取失败时可直接填路径。 |
+| 工作区 | 新会话落在哪个目录；下拉只列出 DSH 当前已打开的工作区，也可以不绑定（用 DSH 默认目录）。不接受手填路径。 |
 | 会话模式 | `continue`：同一来源复用同一个 DSH 会话；`new`：每条消息新建会话。 |
 | 附思考与工具摘要 | 开启时回复末尾追加「— 用时 Xs，工具 N 次」，异常回合带原因。 |
 | 自己的 protocol_id | 可选；网关没有 whoami 接口，填了才能在联系人列表里把自己标出来。 |
@@ -75,7 +75,7 @@ pnpm run inject                                            # 构建 + 注入 + �
 - 网关没有历史消息、群列表、群成员、已读、撤回、多账号接口；本插件也不缓存这些。
 - 群消息只投递给在线成员；无人在线时网关直接返回 `failed`（`reason: "群成员都不在线"`）；本机不在群里报 `-32012`。
 - 一对一离线消息由网关排队，24 小时未送达转 `failed`；同一 `request_id` 的幂等窗口也是 24 小时。
-- 网关无 whoami，无法自动得知本机自己的 `protocol_id`（可手动填）。
+- 网关无 whoami，无法自动得知本机自己的 `protocol_id`（可手动填）。\n- 该网关没有 `subscribe` 方法、也不主动推送：插件在握手时探测到 `-32601` 后改用每 3 秒一次的 `events.resume` 轮询拉事件（`ACK` 之前不会重复下发）；不是「消息到达即触发」，最坏延迟约 3 秒。\n- 明文 `ws://`、无 TLS：只在可信局域网内使用；不要把 9015 端口暴露到不受信任的网络。\n- 工作区只能从 DSH 已打开的工作区里选，不再接受手填路径；没有打开的项目时下拉为空。
 - 令牌只能替换、不能清空（要彻底断开请关闭「启用」并删除 `$DSH_HOME/dsh-lanpost-bridge.json`）。
 - 回复按 4000 字节切段（多段带 `(1/3)` 角标）；中文按 UTF-8 边界切，不会截断半个字。
 - 插件重载/停用会把在途回合静默取消（不发「已取消」消息），排队未开始的消息会被 ACK 但不再回复。
@@ -88,7 +88,7 @@ pnpm run inject                                            # 构建 + 注入 + �
 | 设置页一直「未连接」 | 网关地址/端口、lanpost 客户端是否在运行、令牌是否最新；状态区「最近错误」有原文。 |
 | 关闭码 4401 | 令牌已轮换：到 lanpost 客户端重新生成，粘贴后保存。 |
 | 关闭码 4409 | 连接数超限：通常是另一个 DSH 实例也连着同一网关。 |
-| 手写/连不上且日志有 `-32606` | 握手顺序被破坏（login 必须严格返回 `true` 后才 subscribe）；重启插件会自动重做。 |
+| 日志出现 `网关不支持 subscribe，改用 events.resume 轮询事件` | 正常降级，不是错误：该网关没有订阅方法，插件已转为 3 秒轮询。 |\n| 日志出现 `-32606` | 握手顺序被破坏（login 必须严格返回 `true` 后才 subscribe）；重启插件会自动重做。 |
 | 入站消息没反应 | 群里是否带 `/dsh` 前缀；审计日志 `$DSH_HOME/dsh-lanpost-bridge.audit.log` 里应有 `accepted`/`ignored` 记录。 |
 | 插件没进组合 | `$env:DSH_HOME=...; pnpm exec dsh --profile web --dump-config`，确认有 `our-dsh-lanpost-bridge`。 |
 | 工具说没连上 | 设置页看状态；工具与入站共用同一条连接。 |
@@ -103,7 +103,7 @@ pnpm run check                                     # 仓库根 tsc --noEmit
 
 - 本地状态：`$DSH_HOME/dsh-lanpost-bridge.json`（0600，原子写）。
 - 审计日志：`$DSH_HOME/dsh-lanpost-bridge.audit.log`（0600，仅记录事件动作与会话键，不含令牌与消息正文）。
-- 关键常量集中在 `src/core.ts`：16 KiB 文本上限、4000 字节切段、队列 20、10 分钟超时、去重窗口 500、退避 1s→30s。
+- 关键常量集中在 `src/core.ts`：16 KiB 文本上限、4000 字节切段、队列 20、10 分钟超时、去重窗口 500、退避 1s→30s、默认地址 `localhost:9015`、`ws://<地址>/ws/dsh`；轮询间隔在 `src/gateway.ts` 的 `POLL_INTERVAL_MS = 3000`。
 
 ### 更多边界行为
 

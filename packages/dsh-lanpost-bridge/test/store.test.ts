@@ -16,9 +16,9 @@ test('缺文件时返回默认值且不落盘', () => {
 
 test('保存后可读回，文件权限 0600', () => {
   const dir = home()
-  const state = mergeSettings(DEFAULTS, { gatewayUrl: 'wss://127.0.0.1:1/ws/dsh', token: 'secret-token' })
+  const state = mergeSettings(DEFAULTS, { gatewayAddress: '127.0.0.1:1', token: 'secret-token' })
   saveState(state, dir)
-  assert.equal(loadState(dir).gatewayUrl, 'wss://127.0.0.1:1/ws/dsh')
+  assert.equal(loadState(dir).gatewayAddress, '127.0.0.1:1')
   assert.equal(loadState(dir).token, 'secret-token')
   if (process.platform !== 'win32') assert.equal(statSync(statePath(dir)).mode & 0o777, 0o600)
 })
@@ -98,10 +98,9 @@ test('状态文件字段类型不符时逐项回退默认值，未知键丢弃',
     JSON.stringify({
       version: 2,
       enabled: 'yes',
-      gatewayUrl: 42,
+      gatewayAddress: 42,
       token: 123,
       workspaceId: 7,
-      workspacePath: {},
       sessionMode: 'weird',
       showProcess: 'true',
       selfProtocolId: false,
@@ -143,18 +142,16 @@ test('mergeSettings 白名单与类型校验，接受 string|null', () => {
   const base = mergeSettings(DEFAULTS, {})
   const next = mergeSettings(base, {
     enabled: 'yes',
-    gatewayUrl: 42,
+    gatewayAddress: 42,
     workspaceId: 7,
-    workspacePath: null,
     sessionMode: 'weird',
     showProcess: true,
     selfProtocolId: 'p1',
     token: 123,
   })
   assert.equal(next.enabled, false)
-  assert.equal(next.gatewayUrl, DEFAULTS.gatewayUrl)
+  assert.equal(next.gatewayAddress, DEFAULTS.gatewayAddress)
   assert.equal(next.workspaceId, null)
-  assert.equal(next.workspacePath, null)
   assert.equal(next.sessionMode, 'continue')
   assert.equal(next.showProcess, true)
   assert.equal(next.selfProtocolId, 'p1')
@@ -163,7 +160,6 @@ test('mergeSettings 白名单与类型校验，接受 string|null', () => {
   assert.equal(base.showProcess, false)
 
   assert.equal(mergeSettings(DEFAULTS, { workspaceId: 'w1' }).workspaceId, 'w1')
-  assert.equal(mergeSettings(DEFAULTS, { workspaceId: 'w1', workspacePath: '/tmp/x' }).workspacePath, '/tmp/x')
   assert.equal(mergeSettings(DEFAULTS, { workspaceId: 'w1', selfProtocolId: 'p' }).selfProtocolId, 'p')
   assert.equal(mergeSettings(mergeSettings(DEFAULTS, { workspaceId: 'w1' }), { workspaceId: null }).workspaceId, null)
   assert.equal(mergeSettings(DEFAULTS, { enabled: true }).enabled, true)
@@ -181,12 +177,12 @@ test('mergeSettings 保留非设置字段且返回新对象', () => {
   assert.equal(base.showProcess, false)
 })
 
-test('mergeSettings 对 gatewayUrl 做 trim，空串仍表示清空', () => {
-  const trimmed = mergeSettings(DEFAULTS, { gatewayUrl: '  wss://127.0.0.1:9/ws/dsh \n' })
-  assert.equal(trimmed.gatewayUrl, 'wss://127.0.0.1:9/ws/dsh')
-  assert.equal(mergeSettings(trimmed, { gatewayUrl: '' }).gatewayUrl, '')
-  assert.equal(mergeSettings(trimmed, { gatewayUrl: '   ' }).gatewayUrl, '')
-  assert.equal(trimmed.gatewayUrl, 'wss://127.0.0.1:9/ws/dsh')
+test('mergeSettings 把地址归一为 host:port，非法值保留旧地址', () => {
+  const parsed = mergeSettings(DEFAULTS, { gatewayAddress: '  ws://127.0.0.1:9/ws/dsh \n' })
+  assert.equal(parsed.gatewayAddress, '127.0.0.1:9')
+  assert.equal(mergeSettings(parsed, { gatewayAddress: '' }).gatewayAddress, '127.0.0.1:9')
+  assert.equal(mergeSettings(parsed, { gatewayAddress: 'not a host' }).gatewayAddress, '127.0.0.1:9')
+  assert.equal(parsed.gatewayAddress, '127.0.0.1:9')
 })
 
 test('loadState 跳过 sessions 里的原型链键，seenEventIds 里的同名字符串只是数据', () => {
@@ -261,25 +257,25 @@ test('publicSettings 未配置令牌时 tokenSet=false，且不含内部状态�
   assert.equal(pub.tokenSet, false)
   assert.deepEqual(Object.keys(pub).sort(), [
     'enabled',
-    'gatewayUrl',
+    'gatewayAddress',
     'selfProtocolId',
     'sessionMode',
     'showProcess',
     'tokenSet',
     'workspaceId',
-    'workspacePath',
   ])
   assert.equal('lastSequence' in pub, false)
   assert.equal('sessions' in pub, false)
   assert.equal('seenEventIds' in pub, false)
 })
 
-test('loadState 载入时 trim gatewayUrl，与写入侧一致', () => {
+test('loadState 迁移旧版 gatewayUrl 为 host:port', () => {
   const dir = home()
-  writeFileSync(
-    statePath(dir),
-    `${JSON.stringify({ ...DEFAULTS, gatewayUrl: '  wss://127.0.0.1:8443/ws/dsh  ' })}\n`,
-  )
+  const legacy: Record<string, unknown> = { ...DEFAULTS, gatewayUrl: 'wss://192.168.2.8:9015/ws/dsh' }
+  delete legacy.gatewayAddress
+  writeFileSync(statePath(dir), `${JSON.stringify(legacy)}\n`)
 
-  assert.equal(loadState(dir).gatewayUrl, 'wss://127.0.0.1:8443/ws/dsh')
+  const state = loadState(dir)
+  assert.equal(state.gatewayAddress, '192.168.2.8:9015')
+  assert.equal('gatewayUrl' in state, false)
 })

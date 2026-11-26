@@ -190,7 +190,6 @@ test('PATCH 只传白名单差异：未知键与空 token 丢弃，空字符串�
       token: '',
       evil: 1,
       workspaceId: '',
-      workspacePath: '',
       selfProtocolId: '',
     }),
   })
@@ -198,7 +197,6 @@ test('PATCH 只传白名单差异：未知键与空 token 丢弃，空字符串�
   assert.deepEqual(h.patches[0], {
     sessionMode: 'new',
     workspaceId: null,
-    workspacePath: null,
     selfProtocolId: null,
   })
   assert.equal(h.state.token, 'secret')
@@ -243,9 +241,8 @@ test('PATCH 忽略继承属性：原型被污染时也不会进入 patch', async
   const h = harness()
   const polluted: Record<string, unknown> = {
     enabled: true,
-    gatewayUrl: 'wss://evil.example/ws',
+    gatewayAddress: 'w-evil:1',
     workspaceId: 'w-evil',
-    workspacePath: 'D:/evil',
     selfProtocolId: 'evil',
     sessionMode: 'new',
     showProcess: true,
@@ -325,7 +322,7 @@ test('reconnect 未启用或未配置时 409 且不触发重连', async () => {
   assert.equal(res2.statusCode, 409)
   assert.equal(noToken.reconnects(), 0)
 
-  const noUrl = harness({ state: () => ({ ...DEFAULTS, enabled: true, token: 't', gatewayUrl: ' ' }) })
+  const noUrl = harness({ state: () => ({ ...DEFAULTS, enabled: true, token: 't', gatewayAddress: '' }) })
   const res3 = await call(noUrl.routes, RECONNECT, { method: 'POST', url: RECONNECT })
   assert.equal(res3.statusCode, 409)
 })
@@ -471,6 +468,57 @@ test('意外异常统一 500 internal，响应不回显异常内容', async () =
   assert.equal(h.logs.length, 1)
   assert.equal(res.raw.includes('secret'), false)
   assert.deepEqual(h.logs, ['lanpost-bridge route PATCH /api/lanpost-bridge/settings failed'])
+})
+
+test('PATCH 地址归一为 host:port，非法地址 400 invalid-address', async () => {
+  const h = harness()
+  const ok = await call(h.routes, SETTINGS, {
+    method: 'PATCH',
+    url: SETTINGS,
+    body: JSON.stringify({ gatewayAddress: '  ws://127.0.0.1:9015/ws/dsh  ' }),
+  })
+  assert.equal(ok.statusCode, 200)
+  assert.deepEqual(h.patches[0], { gatewayAddress: '127.0.0.1:9015' })
+
+  for (const bad of ['', 'not a host', '1.2.3.4:99999', 'ws://:9015/ws/dsh']) {
+    const res = await call(harness().routes, SETTINGS, {
+      method: 'PATCH',
+      url: SETTINGS,
+      body: JSON.stringify({ gatewayAddress: bad }),
+    })
+    assert.equal(res.statusCode, 400, `address=${bad}`)
+    assert.deepEqual(res.body, { error: 'invalid-address' })
+  }
+})
+
+test('PATCH 工作区只能是 DSH 已打开的工作区', async () => {
+  const ok = harness()
+  const res = await call(ok.routes, SETTINGS, {
+    method: 'PATCH',
+    url: SETTINGS,
+    body: JSON.stringify({ workspaceId: 'w1' }),
+  })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(ok.patches[0], { workspaceId: 'w1' })
+
+  const unknown = harness()
+  const bad = await call(unknown.routes, SETTINGS, {
+    method: 'PATCH',
+    url: SETTINGS,
+    body: JSON.stringify({ workspaceId: 'nope' }),
+  })
+  assert.equal(bad.statusCode, 400)
+  assert.deepEqual(bad.body, { error: 'unknown-workspace' })
+  assert.deepEqual(unknown.patches, [])
+
+  const cleared = harness()
+  const clear = await call(cleared.routes, SETTINGS, {
+    method: 'PATCH',
+    url: SETTINGS,
+    body: JSON.stringify({ workspaceId: '' }),
+  })
+  assert.equal(clear.statusCode, 200)
+  assert.deepEqual(cleared.patches[0], { workspaceId: null })
 })
 
 test('PATCH 审计只记改了哪些键，不含值', async () => {

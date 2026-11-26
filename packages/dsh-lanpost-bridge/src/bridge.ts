@@ -746,10 +746,9 @@ export class InboundBridge {
     }
   }
 
-  private createRequest(state: BridgeState): { workspaceId?: string; cwd?: string } {
-    if (state.workspaceId) return { workspaceId: state.workspaceId }
-    if (state.workspacePath) return { cwd: state.workspacePath }
-    return {}
+  /** 只在选定工作区时传 workspaceId；未选工作区交给宿主默认目录。 */
+  private createRequest(state: BridgeState): { workspaceId?: string } {
+    return state.workspaceId ? { workspaceId: state.workspaceId } : {}
   }
 
   /** `sessions` 整体替换，不原地改可能被共享的对象。 */

@@ -3,14 +3,15 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { DEFAULT_GATEWAY_ADDRESS, parseGatewayAddress } from './core.ts'
 
 /** 用户可在设置页调整的字段。 */
 export interface BridgeSettings {
   enabled: boolean
-  gatewayUrl: string
+  /** 只存 `host:port`，协议与路径由插件决定（局域网明文，无 TLS）。 */
+  gatewayAddress: string
   token: string
   workspaceId: string | null
-  workspacePath: string | null
   sessionMode: 'continue' | 'new'
   showProcess: boolean
   selfProtocolId: string | null
@@ -38,10 +39,9 @@ const UNSAFE_SESSION_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 /** 未配置时的状态初值（新对象，调用方可以安全修改）。 */
 export const DEFAULTS: BridgeState = {
   enabled: false,
-  gatewayUrl: 'wss://127.0.0.1:8443/ws/dsh',
+  gatewayAddress: DEFAULT_GATEWAY_ADDRESS,
   token: '',
   workspaceId: null,
-  workspacePath: null,
   sessionMode: 'continue',
   showProcess: false,
   selfProtocolId: null,
@@ -70,14 +70,17 @@ function normalizeState(parsed: Record<string, unknown>): BridgeState {
   const state = freshDefaults()
 
   if (typeof parsed.enabled === 'boolean') state.enabled = parsed.enabled
-  // 与写入侧（mergeSettings）保持一致：载入时也 trim，避免状态页显示带空白的地址。
-  if (typeof parsed.gatewayUrl === 'string') state.gatewayUrl = parsed.gatewayUrl.trim()
+  // 地址只存 host:port；旧版本落盘的 `gatewayUrl`（带 ws:// 与 /ws/dsh）在这里迁移。
+  const address =
+    typeof parsed.gatewayAddress === 'string'
+      ? parseGatewayAddress(parsed.gatewayAddress)
+      : typeof parsed.gatewayUrl === 'string'
+        ? parseGatewayAddress(parsed.gatewayUrl)
+        : null
+  if (address !== null) state.gatewayAddress = address
   if (typeof parsed.token === 'string') state.token = parsed.token
   if (typeof parsed.workspaceId === 'string' || parsed.workspaceId === null) {
     state.workspaceId = parsed.workspaceId
-  }
-  if (typeof parsed.workspacePath === 'string' || parsed.workspacePath === null) {
-    state.workspacePath = parsed.workspacePath
   }
   if (parsed.sessionMode === 'continue' || parsed.sessionMode === 'new') {
     state.sessionMode = parsed.sessionMode
@@ -163,9 +166,8 @@ export interface PublicSettings extends Omit<BridgeSettings, 'token'> {
 export function publicSettings(state: BridgeState): PublicSettings {
   return {
     enabled: state.enabled,
-    gatewayUrl: state.gatewayUrl,
+    gatewayAddress: state.gatewayAddress,
     workspaceId: state.workspaceId,
-    workspacePath: state.workspacePath,
     sessionMode: state.sessionMode,
     showProcess: state.showProcess,
     selfProtocolId: state.selfProtocolId,
@@ -175,20 +177,20 @@ export function publicSettings(state: BridgeState): PublicSettings {
 
 /**
  * 合并设置补丁：只接受白名单键，类型不符的值忽略；`token` 为空串或非字符串表示「不改令牌」。
- * `gatewayUrl` 统一 trim，空串表示清空地址。返回新对象，不修改 `state`。
+ * `gatewayAddress` 归一为 `host:port`，非法值忽略（保留旧地址）。返回新对象，不修改 `state`。
  */
 export function mergeSettings(state: BridgeState, patch: Record<string, unknown>): BridgeState {
   const next: BridgeState = { ...state }
   if (!isRecord(patch)) return next
 
   if (typeof patch.enabled === 'boolean') next.enabled = patch.enabled
-  if (typeof patch.gatewayUrl === 'string') next.gatewayUrl = patch.gatewayUrl.trim()
+  if (typeof patch.gatewayAddress === 'string') {
+    const address = parseGatewayAddress(patch.gatewayAddress)
+    if (address !== null) next.gatewayAddress = address
+  }
   if (typeof patch.token === 'string' && patch.token !== '') next.token = patch.token
   if (typeof patch.workspaceId === 'string' || patch.workspaceId === null) {
     next.workspaceId = patch.workspaceId
-  }
-  if (typeof patch.workspacePath === 'string' || patch.workspacePath === null) {
-    next.workspacePath = patch.workspacePath
   }
   if (patch.sessionMode === 'continue' || patch.sessionMode === 'new') {
     next.sessionMode = patch.sessionMode

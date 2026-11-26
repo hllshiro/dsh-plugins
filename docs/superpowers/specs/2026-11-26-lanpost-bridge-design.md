@@ -17,8 +17,8 @@
 
 ### 2.1 网关侧
 
-- WebSocket：`wss://127.0.0.1:8443/ws/dsh`，自签证书；令牌 43 字符 base64url；方法名带命名空间（`rpc.login`、`users.list`、`message.sendUser`、`message.sendGroup`、`media.prepareUpload`、`events.ack`、`events.resume`）。
-- 连接序列：open → `rpc.login({token})`（必须严格返回 `true`）→ `subscribe(['message.received','message.deliveryStatus'])` → `events.resume({last_sequence})`。库自带重连**不会**重做 login/subscribe，必须自己重做；关闭码 `4401` 令牌轮换、`4409` 连接超限。
+- WebSocket：地址只填 `host:port`（默认 `localhost:9015`），插件组装成明文 `ws://<地址>/ws/dsh`；**不使用 TLS**（局域网内使用，2026-11-26 按用户要求调整）；令牌 43 字符 base64url；方法名带命名空间（`rpc.login`、`users.list`、`message.sendUser`、`message.sendGroup`、`media.prepareUpload`、`events.ack`、`events.resume`）。
+- 连接序列：open → `rpc.login({token})`（必须严格返回 `true`）→ 探测 `subscribe([...])`（真实网关**没有**该方法，回 `-32601`）→ `events.resume({last_sequence})`。`-32601` 时降级为轮询模式：每隔 3 秒 `events.resume({last_sequence:lastAcked})` 拉未 ACK 事件；该网关也不主动推送。库自带重连**不会**重做 login，必须自己重做；关闭码 `4401` 令牌轮换、`4409` 连接超限。
 - 只提供：联系人列表 `users.list`（keyword/online/page/page_size）、一对一/群发消息、图片上传、事件 ACK/resume。
 - 文本 UTF-8 ≤ 16 KiB（超出 `-32013`）；`request_id` 幂等 24h，同 id 不同内容 `-32021`；一对一离线 `queued` 后补发，24h 未送达 `failed`；群只投在线成员，无人可达立即 `failed`。
 - 事件：至少一次投递，按 `event_id` 去重、按 `sequence` 顺序 ACK（不许跳号），未 ACK 最多留 7 天；`events.resume(0)` 不补历史。
@@ -69,10 +69,9 @@ packages/lanpost-bridge/
 {
   "version": 1,
   "enabled": true,
-  "gatewayUrl": "wss://127.0.0.1:8443/ws/dsh",
+  "gatewayAddress": "localhost:9015",  // 只存 host:port；旧版 gatewayUrl 载入时自动迁移
   "token": "<43 字符>",          // 只写不读：HTTP/工具投影都不回显
-  "workspaceId": null,           // 与 workspacePath 二选一；都空 = 默认目录
-  "workspacePath": null,
+  "workspaceId": null,           // 只能选 DSH 已打开的工作区；null = 用 DSH 默认目录
   "sessionMode": "continue",     // continue | new
   "showProcess": false,          // true = 回复附思考与工具/耗时摘要
   "selfProtocolId": null,        // 可选：自己的 protocol_id，用来丢弃自回环
@@ -89,13 +88,14 @@ packages/lanpost-bridge/
 
 ## 6. 网关客户端（`src/gateway.ts`）
 
-- 依赖 `ws`（Node 内建 WebSocket 无法对自签证书设置 `rejectUnauthorized:false`）。`new WebSocket(url, { rejectUnauthorized:false, handshakeTimeout: 10000 })`。若目标 profile 装不上 `ws`，退路是内置一个只支持文本帧的最小 RFC6455 客户端（不首选）。
+- 依赖 `ws`（需要自定义 `handshakeTimeout`；构建时外置）。`new WebSocket(url, { handshakeTimeout: 10000 })`，**不设置 TLS 选项**：地址是明文 `ws://<host:port>/ws/dsh`。
 - JSON-RPC 2.0 子集：请求 `{jsonrpc:'2.0', id, method, params}`，响应按 id 归位，`error` 转成本地 `GatewayError{code, message}`；通知按信封识别：`method ∈ {message.received, message.deliveryStatus}` 或 `params` 里带 `event_id/sequence/data`。
-- 连接序列严格按文档：`open` → `rpc.login` → `subscribe` → `events.resume(lastSequence)`；任一步失败都进 `disconnected` 并带原因。
+- 连接序列严格按文档：`open` → `rpc.login` → `subscribe`（探测）→ `events.resume(lastSequence)`；任一步失败都进 `disconnected` 并带原因。
+- `subscribe` 探测：成功则保持推送模式；`-32601` 记日志「网关不支持 subscribe，改用 events.resume 轮询事件」并降级为轮询模式——`setTimeout(3000)` 循环 `events.resume({last_sequence:lastAcked})`，空 `events` 时把游标推进到 `latest_sequence`，`-32020` 重置游标，定时器 `unref()` 且 `stop`/`close` 时清掉。
 - 重连：指数退避 1s→2s→4s…→30s，带 ±20% 抖动；`4401` 停止重试并在设置页提示「令牌已轮换，请更新令牌」；`4409` 退避拉长并在状态里提示「连接数超限」。
 - 超时：每个请求带 `AbortSignal.timeout(见 2.1 表)`；`events.ack` 失败不阻塞后续（重连后 resume 会补）。
 - ACK 队列：收到的 `sequence` 入待确认集合，只有当 `lastAcked + 1` 在集合里才发送 `events.ack`，逐条推进（满足「不许跳号」）；`lastAcked` 立即落盘（至少每 10 条或 3 秒刷一次）。
-- 订阅回调把事件交给 `bridge.handle(event)`，**处理失败也要 ACK**（否则会 7 天内反复补发同一条），失败原因写状态页与审计日志。
+- 事件入口（推送帧或轮询拉到的信封）都走同一条串行链交给 `bridge.handle(event)`，**处理失败也要 ACK**（否则会 7 天内反复补发同一条），失败原因写状态页与审计日志。
 - 提供：`connect()`、`disconnect()`、`call(method, params, timeoutMs)`、`state()`、`sendUser/sendGroup` 薄封装。
 
 ## 7. 入站编排（`src/bridge.ts`）
@@ -160,7 +160,7 @@ packages/lanpost-bridge/
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | GET | `/api/lanpost-bridge/settings` | 返回设置（token 只回 `tokenSet: boolean`） |
-| PATCH | `/api/lanpost-bridge/settings` | 局部更新（无 `token` 字段则保持原值），落盘后热应用 |
+| PATCH | `/api/lanpost-bridge/settings` | 局部更新（无 `token` 字段则保持原值；地址归一为 `host:port`；`workspaceId` 必须在已打开工作区里），落盘后热应用 |
 | POST | `/api/lanpost-bridge/reconnect` | 主动重连（清重试退避） |
 | GET | `/api/lanpost-bridge/status` | 连接状态、错误、游标、映射表（来源 + 会话 id + 时间） |
 | GET | `/api/lanpost-bridge/workspaces` | `workspaceRegistry.list()` → `{id,title,path}` |
@@ -169,8 +169,8 @@ packages/lanpost-bridge/
 ### 9.2 设置页（`settings.section`，id `lanpost-bridge`）
 
 - 开关：启用桥接。
-- 网关地址（默认 `wss://127.0.0.1:8443/ws/dsh`）+ 令牌（password 输入，留空 = 不变，占位显示「已保存」）。
-- 工作区：下拉（来自 `/workspaces`）+「自定义路径」输入 + 「默认目录」。
+- 网关地址：只填 `ip:port`（默认 `localhost:9015`，hint 说明插件自动用 `ws://`、不走 TLS；粘贴带 scheme/路径会归一，非法值 400 `invalid-address`）+ 令牌（password 输入，留空 = 不变，占位显示「已保存」）。
+- 工作区：下拉（只列 DSH 已打开的工作区，来自 `/workspaces`；提交时后端校验必须存在，否则 400 `unknown-workspace`）+ 「默认目录」；**不再提供自定义路径**，下拉为空时提示「暂无可用工作区，请先在 DSH 中打开一个项目目录」。
 - 会话模式：继续会话 / 每条消息新建会话（单选，带解释文案）。
 - 回复内容：是否包含思考与工具摘要。
 - 可选：自己的 `protocol_id`（防自回环）。
@@ -240,14 +240,23 @@ packages/lanpost-bridge/
 6. 空回复文案「（本轮没有文本回复）」；满队列回 `QUEUE_FULL_NOTICE`。
 7. `deliveryStatus` 为 `string | null`，网关未返回时不伪造状态值。
 8. 路由前缀 `/api/lanpost-bridge`；`settings` 一条路由合并 GET/PATCH，`sessions` 用 `kind: 'prefix'` + `DELETE /sessions/<key>`；状态响应只投影已知字段。
-9. 保存时 `gatewayUrl` trim；令牌只能替换、不能清空（彻底断开＝停用或删状态文件）。
+9. 保存时地址归一为 `host:port`（非法值 400）；令牌只能替换、不能清空（彻底断开＝停用或删状态文件）。
 10. 主题色使用宿主真实 token：`--dsw-alias-state-{error,success,warn}-primary`、`--dsw-alias-bg-layer-3`、`--dsw-alias-label-primary-foreground`。
 11. `lanpost_find_contact` 截断保守判断：返回 20 条即提示「可能还有更多」（网关无分页总数时的兜底）。
 
 ### 15.3 验证结论（2026-11-26）
 
-- 单测：`node --test "test/*.test.ts"` → **216/216 pass**（core 13、store 21、gateway 23、bridge 入站 37、bridge 回复 35、tools 26、routes 25、plugin 12、client 21、audit 6）。
+- 单测：`node --test "test/*.test.ts"` → **224/224 pass**（含 2026-11-26 局域网调整新增：地址解析/迁移、工作区校验、轮询降级 4 条）。
 - 类型/构建：`pnpm run check` 通过；`pnpm run build` 四包全过；三工具输出经宿主 `validateJsonSchemaValue` 实测 10/10 通过。
 - 组合：`DSH_HOME=.dsh-dev node scripts/inject.mjs` → `✓ our-dsh-lanpost-bridge`（our- 行 3 条）。
 - 真实宿主：`dsh web --no-open`（dev profile）启动后**无激活告警**（首轮曾因工具 output schema 使用 `anyOf` 被宿主拒绝，已改 `oneOf`）；`GET /api/lanpost-bridge/{settings,status,workspaces}` 均 200 且形状与设置页契约一致；PATCH 设置成功落盘（0600），`enabled=true` 且无令牌时保持 `idle` 不自旋。
 - **未完成**：lanpost 客户端本机未安装（8443 未监听），真机链路（登录 → 发消息 → 触发会话 → 回发）无法在本轮实测；设置页的浏览器内观感（slot 渲染、深色主题）也未做界面确认。两项列在 §14 M3 的验收清单里，需要 lanpost 客户端在场时补测。
+
+### 15.4 局域网调整（2026-11-26，用户 m01381 要求）
+
+- **地址**：设置项由 `gatewayUrl`（完整 URL）改为 `gatewayAddress`（只存 `host:port`），默认 `localhost:9015`；`parseGatewayAddress` 接受带 `ws://`/路径的粘贴值并归一，非法值 400 `invalid-address`；`gatewayWsUrl()` 组装 `ws://<地址>/ws/dsh`。旧状态文件的 `gatewayUrl` 在 `loadState` 时自动迁移。
+- **TLS**：去掉 `rejectUnauthorized`，只建明文 `ws://`（局域网使用）。
+- **工作区**：删 `workspacePath`（自定义路径），只保留 `workspaceId`；`PATCH /settings` 校验它必须存在于 `workspaceRegistry.list()`，否则 400 `unknown-workspace`；`sessionController.create` 只传 `{ workspaceId }` 或不传。
+- **真实网关探测结论**：`192.168.2.8:9015` 可连、`rpc.login` 返回 `true`、`users.list` 正常；但 `client.subscribe`/`subscribe`/`rpc.subscribe`/`events.subscribe` 等**全部** `-32601 Method not found`（文档里的订阅 API 是参考库的方法，不是线上方法），且登录后不主动推送任何通知帧。「握手失败：Method not found」即由此而来。
+- **降级**：握手时 `trySubscribe()` 探测，`-32601` 即转 `events.resume` 轮询（`POLL_INTERVAL_MS = 3000`，可经 `pollIntervalMs` 覆盖）；空 `events` 推进游标、`-32020` 重置游标、`stop`/`close` 清定时器。`ACK` 之前的同一事件不会重复下发，因此轮询不会重复处理。
+- 真实链路验证：dev profile 启用后 `state: connected`、`lastSequence: 2`（握手后第一轮轮询拉到并 ACK 了两条历史 `message.deliveryStatus`），之后无新事件时游标保持稳定。

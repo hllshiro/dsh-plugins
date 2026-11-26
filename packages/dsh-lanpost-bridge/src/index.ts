@@ -6,6 +6,7 @@ import { dirname } from 'node:path'
 import { InboundBridge } from './bridge.ts'
 import type { ReplyTarget } from './bridge.ts'
 import { LanpostGateway } from './gateway.ts'
+import { gatewayWsUrl } from './core.ts'
 import {
   loggerOf,
   onSessionEvent,
@@ -42,7 +43,7 @@ const LANPOST_PROMPT = `当用户要求通过 lanpost（局域网 IM）发消息
 
 /**
  * 装配插件。所有注册都经 `ctx.effect()` 记账，卸载时按 LIFO 回卷；
- * 网关的启停只由 `enabled` / `gatewayUrl` / `token` 决定，其余设置只更新内存状态。
+ * 网关的启停只由 `enabled` / `gatewayAddress` / `token` 决定，其余设置只更新内存状态。
  */
 export function apply(ctx: Context): void {
   const log = loggerOf(ctx)
@@ -116,7 +117,7 @@ export function apply(ctx: Context): void {
     stopGateway()
     // 从这一刻起处于 idle/connecting；跳过或构造失败时 status().since 都以此刻为准。
     idleSince = Date.now()
-    const url = state.gatewayUrl.trim()
+    const url = state.gatewayAddress === '' ? '' : gatewayWsUrl(state.gatewayAddress)
     if (!state.enabled || state.token === '' || url === '') {
       // 未启用/未配置不是错误：保持 idle，等设置页保存或重连接口再启动。
       log.info('lanpost-bridge: gateway skipped (disabled or unconfigured)')
@@ -165,7 +166,7 @@ export function apply(ctx: Context): void {
       // 只有影响连接本身的字段才重建网关；其余设置保存即生效，不打断现有连接。
       const restart =
         next.enabled !== state.enabled ||
-        next.gatewayUrl !== state.gatewayUrl ||
+        next.gatewayAddress !== state.gatewayAddress ||
         next.token !== state.token
       // 先落盘再改内存：写盘失败时内存保持旧值，routes 把异常翻成 500，设置页不会看到「半生效」。
       saveState(next, home)

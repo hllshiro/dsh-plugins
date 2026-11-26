@@ -108,7 +108,7 @@ interface StatusConnection {
 
 interface StatusValue {
   enabled: boolean
-  gatewayUrl: string
+  gatewayAddress: string
   connection: StatusConnection
   lastSequence: number | null
   tokenSet: boolean
@@ -467,7 +467,7 @@ test('find_contact 对异常响应（缺 users 数组）明确报错而非静默
 test('bridge_status 汇总连接/游标/映射数量，绝不返回令牌原文', async () => {
   const state = makeState({
     enabled: true,
-    gatewayUrl: 'wss://127.0.0.1:8443/ws/dsh',
+    gatewayAddress: '127.0.0.1:8443',
     token: 'TOP-SECRET-TOKEN',
     lastSequence: 42,
     sessionMode: 'new',
@@ -492,7 +492,7 @@ test('bridge_status 汇总连接/游标/映射数量，绝不返回令牌原文'
 
   assert.deepEqual(value, {
     enabled: true,
-    gatewayUrl: 'wss://127.0.0.1:8443/ws/dsh',
+    gatewayAddress: '127.0.0.1:8443',
     connection: { state: 'connected', since: 1_700_000_000_000 },
     lastSequence: 42,
     tokenSet: true,

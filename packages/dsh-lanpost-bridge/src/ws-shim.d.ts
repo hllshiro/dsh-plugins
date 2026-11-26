@@ -6,7 +6,7 @@
  */
 declare module 'ws' {
   class WebSocket {
-    constructor(url: string, options?: { rejectUnauthorized?: boolean; handshakeTimeout?: number })
+    constructor(url: string, options?: { handshakeTimeout?: number })
     send(data: string): void
     close(code?: number, reason?: string): void
     on(event: string, listener: (...args: any[]) => void): this

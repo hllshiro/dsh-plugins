@@ -51,6 +51,7 @@ function makeGateway(
     lastSequence?: number
     events?: Record<string, unknown>
     reconnectBaseMs?: number
+    pollIntervalMs?: number
   } = {},
 ): LanpostGateway {
   const gw = new LanpostGateway({
@@ -59,6 +60,7 @@ function makeGateway(
     lastSequence: options.lastSequence ?? 0,
     events: options.events ?? {},
     reconnectBaseMs: options.reconnectBaseMs,
+    pollIntervalMs: options.pollIntervalMs,
     transport: f.transport,
   } as any)
   running.push(gw)
@@ -714,5 +716,143 @@ test('重置时在途 ACK 恰好是 lastAcked+1（sequence 1）也会被 epoch �
   await settle()
   for (let guard = 0; guard < 10 && acked.length < 2; guard += 1) await ackOk(f)
   assert.deepEqual(acked, [1, 2])
+  assert.equal(gw.status().state, 'connected')
+})
+
+// ---- 轮询模式：网关没有 subscribe 方法（-32601）时改用 events.resume 拉事件 ----
+
+/** 等到出现一个尚未应答的 events.resume 请求，返回它的 id。 */
+async function awaitResume(f: FakeTransport, seen: Set<number>): Promise<number> {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const pending = frames(f).filter(
+      (frame) => frame.method === 'events.resume' && frame.id !== undefined && !seen.has(frame.id),
+    )
+    if (pending.length > 0) {
+      const id = pending[0].id as number
+      seen.add(id)
+      return id
+    }
+    await sleep(2)
+  }
+  throw new Error('没有等到新的 events.resume 请求')
+}
+
+const replyToId = (f: FakeTransport, id: number, result: unknown): void => {
+  f.emit('message', JSON.stringify({ jsonrpc: '2.0', id, result }))
+}
+
+test('subscribe 返回 -32601 时降级为 events.resume 轮询，事件照常分发与 ACK', async () => {
+  const f = fakeTransport()
+  const received: string[] = []
+  const acked: number[] = []
+  const gw = makeGateway(f, {
+    pollIntervalMs: 5,
+    events: {
+      onMessage: (message: any) => received.push(message.messageId),
+      onAck: (sequence: number) => acked.push(sequence),
+    },
+  })
+  gw.start()
+  f.emit('open')
+  await settle()
+  replyTo(f, 'rpc.login', true)
+  await settle()
+  replyErrorTo(f, 'subscribe', { code: -32601, message: 'Method not found' })
+  await settle()
+  // 握手末尾仍有一次 resume；确认后状态才进入 connected，随后才开始轮询。
+  replyTo(f, 'events.resume', { latest_sequence: 0, events: [] })
+  await settle()
+  assert.equal(gw.status().state, 'connected')
+
+  const seen = new Set<number>(resumeFrames(f).map((frame) => frame.id as number))
+  const first = await awaitResume(f, seen)
+  assert.equal(requestFrame(f, 'events.resume').params.last_sequence, 0)
+
+  replyToId(f, first, { latest_sequence: 1, events: [receivedEnvelope(1)] })
+  await settle()
+  assert.deepEqual(received, ['m1'])
+  assert.equal(ackFrames(f).at(-1)?.params.sequence, 1)
+  await ackOk(f)
+  assert.deepEqual(acked, [1])
+
+  // 下一次轮询带已 ACK 的游标；空响应把游标推进到 latest_sequence。
+  const second = await awaitResume(f, seen)
+  assert.equal(requestFrame(f, 'events.resume').params.last_sequence, 1)
+  replyToId(f, second, { latest_sequence: 1, events: [] })
+  await settle()
+
+  const third = await awaitResume(f, seen)
+  assert.equal(requestFrame(f, 'events.resume').params.last_sequence, 1)
+  replyToId(f, third, { latest_sequence: 2, events: [receivedEnvelope(2)] })
+  await settle()
+  assert.deepEqual(received, ['m1', 'm2'])
+  await ackOk(f)
+  assert.deepEqual(acked, [1, 2])
+})
+
+test('subscribe 成功时保持推送模式，不启动轮询', async () => {
+  const f = fakeTransport()
+  const gw = makeGateway(f, { pollIntervalMs: 5 })
+  gw.start()
+  f.emit('open')
+  await settle()
+  replyTo(f, 'rpc.login', true)
+  await settle()
+  replyTo(f, 'subscribe', true)
+  await settle()
+  replyTo(f, 'events.resume', { latest_sequence: 0, events: [] })
+  await settle()
+
+  const before = resumeFrames(f).length
+  await sleep(40)
+  assert.equal(resumeFrames(f).length, before, '推送模式下不得轮询')
+})
+
+test('stop 之后不再轮询', async () => {
+  const f = fakeTransport()
+  const gw = makeGateway(f, { pollIntervalMs: 5 })
+  gw.start()
+  f.emit('open')
+  await settle()
+  replyTo(f, 'rpc.login', true)
+  await settle()
+  replyErrorTo(f, 'subscribe', { code: -32601, message: 'Method not found' })
+  await settle()
+  replyTo(f, 'events.resume', { latest_sequence: 0, events: [] })
+  await settle()
+
+  const seen = new Set<number>(resumeFrames(f).map((frame) => frame.id as number))
+  const first = await awaitResume(f, seen)
+  replyToId(f, first, { latest_sequence: 0, events: [] })
+  await settle()
+
+  gw.stop()
+  const stoppedAt = resumeFrames(f).length
+  await sleep(40)
+  assert.equal(resumeFrames(f).length, stoppedAt, 'stop 后定时器必须清掉')
+})
+
+test('轮询遇到 -32020 时重置游标并继续拉取', async () => {
+  const f = fakeTransport()
+  const gw = makeGateway(f, { pollIntervalMs: 5 })
+  gw.start()
+  f.emit('open')
+  await settle()
+  replyTo(f, 'rpc.login', true)
+  await settle()
+  replyErrorTo(f, 'subscribe', { code: -32601, message: 'Method not found' })
+  await settle()
+  replyTo(f, 'events.resume', { latest_sequence: 0, events: [] })
+  await settle()
+
+  const seen = new Set<number>(resumeFrames(f).map((frame) => frame.id as number))
+  const first = await awaitResume(f, seen)
+  replyErrorTo(f, 'events.resume', { code: -32020, message: 'EVENT_CURSOR_EXPIRED' })
+  await settle()
+
+  const second = await awaitResume(f, seen)
+  assert.equal(requestFrame(f, 'events.resume').params.last_sequence, 0)
+  replyToId(f, second, { latest_sequence: 0, events: [] })
+  await settle()
   assert.equal(gw.status().state, 'connected')
 })

@@ -1,8 +1,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  DEFAULT_GATEWAY_ADDRESS,
   dedupeAdd,
   formatDuration,
+  gatewayWsUrl,
+  parseGatewayAddress,
   promptTextFor,
   replyParts,
   splitUtf8,
@@ -133,4 +136,25 @@ test('formatDuration 边界', () => {
   // 59m59.999s 四舍五入到 60 秒时要进位成 60m，不能输出 `59m 60s`。
   assert.equal(formatDuration(3599999), '60m 0s')
   assert.equal(formatDuration(119999), '2m 0s')
+})
+
+test('parseGatewayAddress：只接受 host:port，接受带 scheme/path 的粘贴值', () => {
+  assert.equal(DEFAULT_GATEWAY_ADDRESS, 'localhost:9015')
+  assert.equal(parseGatewayAddress('localhost:9015'), 'localhost:9015')
+  assert.equal(parseGatewayAddress('  192.168.2.8:9015  '), '192.168.2.8:9015')
+  assert.equal(parseGatewayAddress('ws://192.168.2.8:9015/ws/dsh'), '192.168.2.8:9015')
+  assert.equal(parseGatewayAddress('wss://example.local:8443'), 'example.local:8443')
+  assert.equal(parseGatewayAddress('[::1]:9015'), '[::1]:9015')
+  assert.equal(parseGatewayAddress('[::1]'), null)
+  assert.equal(parseGatewayAddress('1.2.3.4'), null)
+  assert.equal(parseGatewayAddress('1.2.3.4:99999'), null)
+  assert.equal(parseGatewayAddress('1.2.3.4:0'), null)
+  assert.equal(parseGatewayAddress(''), null)
+  assert.equal(parseGatewayAddress('   '), null)
+  assert.equal(parseGatewayAddress('http://1.2.3.4:9015'), '1.2.3.4:9015')
+})
+
+test('gatewayWsUrl：地址组装成明文 ws 地址', () => {
+  assert.equal(gatewayWsUrl('localhost:9015'), 'ws://localhost:9015/ws/dsh')
+  assert.equal(gatewayWsUrl('[::1]:9015'), 'ws://[::1]:9015/ws/dsh')
 })
