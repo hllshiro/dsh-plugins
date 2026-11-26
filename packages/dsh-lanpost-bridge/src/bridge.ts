@@ -317,7 +317,7 @@ export class InboundBridge {
 
     switch (event.type) {
       case 'user/message': {
-        const rpcId = event.data.source?.rpcId
+        const rpcId = event.data?.source?.rpcId
         if (typeof rpcId !== 'string') return
         const waiter = this.waiters.get(rpcId)
         if (!waiter || waiter.settled || waiter.sessionId !== sessionId) return

@@ -396,8 +396,11 @@ test('同会话连续两轮：串行投递且互不串扰', async () => {
 
   // 第一轮还没结束就投第二条：必须排队，不能复用第一轮 waiter。
   const second = s.bridge.handleMessage(msg({ eventId: 'e2', messageId: 'm2', content: { type: 'text', text: '第二条' } }))
+  let secondAcked = false
+  void second.then(() => { secondAcked = true })
   await tick()
   assert.equal(s.prompts.length, 1, '第一轮未结束前不得投递第二轮')
+  assert.equal(secondAcked, false, '排队中的消息不得在第一轮结束前被 ACK 接管')
 
   endTurn(s)
   await s.waitForReply(1)
