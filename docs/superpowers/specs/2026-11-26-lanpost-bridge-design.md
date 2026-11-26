@@ -264,4 +264,4 @@ packages/lanpost-bridge/
 
 - **问题**：原 `lanpost_find_contact` 与远端语义不一致——远端 `users.list` 是联系人**名册**（`keyword` 可选、`page`、`page_size` ≤200、返回 `total`），而工具要求 `keyword` 必填、固定 `page=1`/`page_size=20`、`truncated` 靠猜测，导致列不出全量、超过 20 条无法继续，名字也误导模型把它当搜索器。
 - **决定**：方案 B（用户 m02089）——工具改名 `lanpost_list_contacts`，`keyword` 可选（省略/空串=不过滤），新增 `page`（1 基）与 `page_size`（默认 50、上限 200）；输出带 `total`/`page`/`page_size`；`truncated` 优先用 `page*page_size < total`，缺 `total` 时本页取满即提示「可能还有更多」。`lanpost_send_message` 描述与系统提示段同步改引用。
-- **验证**：包测试 225/225、`pnpm run check`、`pnpm run build` 通过；注入校验与真实宿主调用待本轮收尾一并执行。
+- **验证**：包测试 225/225；`pnpm run check`、`pnpm run build` 通过；注入校验 `✓ our-dsh-lanpost-bridge`；宿主 schema 校验器对新输出 8/8 通过（过程中抓到输出字段 `pageSize` 与 schema `page_size` 不一致，已修复）；dev profile `dsh web` 启动无激活告警，`GET /api/lanpost-bridge/settings` 正常。模型层实际调用未做（测试会话没有可用网关，且 headless profile 未安装）。
