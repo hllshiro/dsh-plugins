@@ -1,6 +1,6 @@
 {
   "name": "@hllshiro/dsh-lanpost-bridge",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": false,
   "license": "UNLICENSED",
   "type": "module",
@@ -28,7 +28,7 @@
     "test": "node --test \"test/*.test.ts\""
   },
   "dependencies": {
-    "ws": "^8.21.0"
+    "ws": "catalog:"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1"
