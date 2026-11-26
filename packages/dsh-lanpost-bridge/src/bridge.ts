@@ -24,8 +24,6 @@ export type { SessionEventLike }
 export const IMAGE_NOTICE = '暂不支持图片消息（当前仅支持文本）。'
 /** 未知 content 类型的回退文案。 */
 export const UNSUPPORTED_NOTICE = '暂不支持该类型的消息（当前仅支持文本）。'
-/** 群 `/dsh` 后没跟正文时的用法提示。 */
-export const USAGE_NOTICE = '用法：/dsh <问题>'
 /** 排队超限提示；条数与 `QUEUE_LIMIT` 保持同一来源。 */
 export const QUEUE_FULL_NOTICE = `我这边还排着 ${QUEUE_LIMIT} 条消息，稍后再发。`
 
@@ -194,6 +192,32 @@ function isBlank(text: string): boolean {
   return text.trim() === ''
 }
 
+/** 外部可控名字（显示名/用户名/群 id）截断到的最大码点数。 */
+const SOURCE_TEXT_MAX = 64
+/** 控制字符、零宽字符与 bidi 覆盖字符：折叠为空格，防止伪造来源行。 */
+const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2028\u2029\u2066-\u2069]/g
+
+/**
+ * 净化要进来源行/会话标题的外部字符串：控制与不可见字符→空格、去掉方括号、
+ * 空白折叠、按码点截断；净化后为空时回退 `fallback`。
+ * `display_name`、`username`、`group_id` 都来自对端，不净化就能插入换行伪造来源行。
+ */
+function sanitizeSourceText(raw: string, fallback: string): string {
+  const cleaned = raw
+    .replace(CONTROL_CHARS, ' ')
+    .replace(/[[\]]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const clipped = Array.from(cleaned).slice(0, SOURCE_TEXT_MAX).join('').trim()
+  return clipped === '' ? fallback : clipped
+}
+
+/** 群门禁：命中 `/dsh` 前缀则返回剥掉前缀与紧随空白的正文（可能为空），未命中返回 null。 */
+function groupBodyOf(text: string): string | null {
+  const stripped = stripGroupTrigger(text)
+  return stripped === null ? null : stripped.trim()
+}
+
 /** 群 id 优先取 `groupId`，缺省从 `conversationId` 的 `group:` 前缀切。 */
 function groupIdOf(event: InboundMessage): string | undefined {
   if (event.groupId) return event.groupId
@@ -207,6 +231,8 @@ export class InboundBridge {
   private readonly deps: InboundDeps
   private readonly queues = new Map<string, QueueSlot>()
   private readonly waiters = new Map<string, TurnWaiter>()
+  /** 在途 prompt 的取消句柄：`dispose()` 时全部 abort，别让回合在停用后继续跑。 */
+  private readonly inflight = new Set<AbortController>()
   private unsubscribe: (() => void) | undefined
   private disposed = false
 
@@ -218,13 +244,16 @@ export class InboundBridge {
   /** 处理一条 `message.received`。重复事件、被过滤的消息直接返回。 */
   async handleMessage(event: InboundMessage): Promise<void> {
     if (this.disposed) return
-    if (!this.rememberSeen(event)) return
 
+    // 先判定再记去重：被门禁丢掉的消息既不占窗口，也不触发状态写盘。
     const plan = this.plan(event)
     if (plan.kind === 'drop') {
       this.audit({ action: 'ignored', eventId: event.eventId, reason: plan.reason })
       return
     }
+
+    if (!this.rememberSeen(event)) return
+    if (this.disposed) return
 
     this.audit({
       action: 'accepted',
@@ -273,6 +302,9 @@ export class InboundBridge {
     this.unsubscribe = undefined
     // 先退订再结算：结算过程中的发送失败不会因为事件回流而重入。
     for (const waiter of [...this.waiters.values()]) this.settle(waiter, 'canceled')
+    // 在途 prompt 一并中止：等待器已结算，迟到的接受不该再让回合继续跑。
+    for (const controller of this.inflight) controller.abort(new Error('lanpost-bridge: disposed'))
+    this.inflight.clear()
     this.queues.clear()
   }
 
@@ -424,59 +456,73 @@ export class InboundBridge {
 
   // ── 判定 ────────────────────────────────────────────────────────────────
 
-  /** 去重窗口同时记 `messageId` 与 `eventId`：先记 messageId 再前插 eventId。 */
+  /**
+   * 去重窗口同时记 `messageId` 与 `eventId`：两维任一已出现都算重复，
+   * 所以必须 `&&`（只换 `event_id` 的补发也要拦住）。两者都为空时不去重。
+   */
   private rememberSeen(event: InboundMessage): boolean {
-    let fresh = false
+    const hasMessageId = event.messageId !== ''
+    const hasEventId = event.eventId !== ''
+    if (!hasMessageId && !hasEventId) return true
+
+    let fresh = true
     this.deps.update((state) => {
-      const first = dedupeAdd(state.seenEventIds, event.messageId, SEEN_LIMIT)
-      let list = first.list
-      let added = first.added
-      if (event.eventId !== '' && event.eventId !== event.messageId) {
-        const second = dedupeAdd(list, event.eventId, SEEN_LIMIT)
-        list = second.list
-        // eventId 已见过就是重复补发：即便 messageId 没记过也必须丢弃。
-        added = second.added
+      let list = state.seenEventIds
+      if (hasMessageId) {
+        const step = dedupeAdd(list, event.messageId, SEEN_LIMIT)
+        list = step.list
+        fresh = step.added
+      }
+      if (hasEventId && event.eventId !== event.messageId) {
+        const step = dedupeAdd(list, event.eventId, SEEN_LIMIT)
+        list = step.list
+        fresh = fresh && step.added
       }
       // 用新数组整体替换，不原地改入参（`mergeSettings` 是浅拷贝，数组可能共享）。
       state.seenEventIds = list
-      fresh = added
     })
     return fresh
   }
 
   private plan(event: InboundMessage): Plan {
     const self = this.deps.state().selfProtocolId
-    if (self !== null && self !== '' && event.sender.protocolId === self) {
+    const senderId = event.sender.protocolId
+    // 空发送方无法建会话也无法回发，还会拼出 `direct:` 这样的空键。
+    if (senderId === '') return { kind: 'drop', reason: 'missing-sender' }
+    if (self !== null && self !== '' && senderId === self) {
       return { kind: 'drop', reason: 'self-loop' }
     }
 
-    const whoName = event.sender.displayName === '' ? event.sender.username : event.sender.displayName
     const content: { type: string; text?: string } = event.content
     const text = content.type === 'text' ? (content.text ?? '') : null
 
-    if (event.conversationType === 'group') {
-      const groupId = groupIdOf(event)
+    // 外部字段进来源行/会话标题前统一净化：`]` 与换行可伪造 `[lanpost …]` 行。
+    const username = sanitizeSourceText(event.sender.username, '')
+    const displayName = sanitizeSourceText(event.sender.displayName, '')
+    const whoName = displayName !== '' ? displayName : username !== '' ? username : '未知用户'
+    const rawGroupId = groupIdOf(event)
+    const groupId = rawGroupId === undefined ? undefined : sanitizeSourceText(rawGroupId, '未知群')
+    // gateway 把非 `group` 归一成 `private`；会话键是 `group:` 的消息仍要按群门禁处理。
+    const isGroup = event.conversationType === 'group' || groupId !== undefined
+
+    if (isGroup) {
       if (!groupId) return { kind: 'drop', reason: 'missing-group-id' }
 
       const key = `${GROUP_PREFIX}${groupId}`
       const target: ReplyTarget = { kind: 'group', groupId }
-      const source: ReplySource = {
-        kind: 'group',
-        name: whoName,
-        username: event.sender.username,
-        groupId,
-      }
+      const source: ReplySource = { kind: 'group', name: whoName, username, groupId }
 
       if (text === null) return { kind: 'drop', reason: 'unsupported-content' }
-      const stripped = stripGroupTrigger(text)
+      const stripped = groupBodyOf(text)
       if (stripped === null) return { kind: 'drop', reason: 'missing-trigger' }
-      if (isBlank(stripped)) return { kind: 'notice', key, target, text: USAGE_NOTICE, source }
+      // `/dsh` 后没跟正文：静默丢弃（design 7.2），不在群里回用法提示。
+      if (stripped === '') return { kind: 'drop', reason: 'empty-after-prefix' }
       return { kind: 'prompt', key, target, text: stripped, source }
     }
 
-    const key = `${PRIVATE_PREFIX}${event.sender.protocolId}`
-    const target: ReplyTarget = { kind: 'user', protocolId: event.sender.protocolId }
-    const source: ReplySource = { kind: 'private', name: whoName, username: event.sender.username }
+    const key = `${PRIVATE_PREFIX}${senderId}`
+    const target: ReplyTarget = { kind: 'user', protocolId: senderId }
+    const source: ReplySource = { kind: 'private', name: whoName, username }
 
     if (text === null) {
       const notice = content.type === 'image' ? IMAGE_NOTICE : UNSUPPORTED_NOTICE
@@ -522,9 +568,12 @@ export class InboundBridge {
     let phase: 'session' | 'prompt' = 'session'
     try {
       const session = await this.ensureSession(plan.key, plan.source, event)
+      if (this.disposed) return
       phase = 'prompt'
       await this.deliver(plan, session.sessionId, event)
     } catch (error) {
+      // 停用期间被中止的 prompt 不是业务失败，收尾提示已由 dispose 结算。
+      if (this.disposed) return
       const text =
         phase === 'session'
           ? `创建会话失败：${errorMessage(error)}`
@@ -548,13 +597,15 @@ export class InboundBridge {
     event: InboundMessage,
   ): Promise<{ sessionId: string }> {
     const state = this.deps.state()
-    if (state.sessionMode === 'continue') {
+    const mode = state.sessionMode
+    if (mode === 'continue') {
       const mapped = state.sessions[key]
       if (mapped) return { sessionId: mapped.sessionId }
     }
 
     const created = await this.deps.sessions.create(this.createRequest(state))
-    this.remember(key, created.sessionId)
+    // `new` 模式每条消息都开新会话，映射保持原样；只有 `continue` 记最近一条。
+    if (mode === 'continue') this.remember(key, created.sessionId)
     this.audit({ action: 'session-created', eventId: event.eventId, key, sessionId: created.sessionId })
     await this.retitle(created.sessionId, source)
     return { sessionId: created.sessionId }
@@ -595,6 +646,7 @@ export class InboundBridge {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(new Error('lanpost-bridge: prompt timed out')), PROMPT_TIMEOUT_MS)
     timer.unref()
+    this.inflight.add(controller)
     try {
       await this.deps.sessions.prompt(request, controller.signal)
     } catch (error) {
@@ -603,6 +655,7 @@ export class InboundBridge {
       throw error
     } finally {
       clearTimeout(timer)
+      this.inflight.delete(controller)
     }
 
     // prompt 只表示「已入队」；最终文本要等本轮 turn/end（或超时/停用）才回发。
