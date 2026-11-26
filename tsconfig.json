@@ -6,7 +6,8 @@
     "lib": ["ES2024", "DOM"],
     "strict": true,
     "noEmit": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true
   },
-  "include": ["packages/*/src", "scripts/plugin-build.ts"]
+  "include": ["packages/*/src", "packages/*/test", "scripts/plugin-build.ts"]
 }

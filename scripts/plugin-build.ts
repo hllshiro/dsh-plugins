@@ -6,12 +6,19 @@ import { isBuiltin } from 'node:module'
 import { join } from 'node:path'
 import type { UserConfig } from 'tsdown'
 
-export function pluginBuilds(packageDir: string, options: { client?: boolean } = {}): UserConfig[] {
+export function pluginBuilds(
+  packageDir: string,
+  options: { client?: boolean; external?: readonly string[] } = {},
+): UserConfig[] {
   const manifest = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8')) as { name: string }
   const name = manifest.name
-  // 模块表内的包（react、@deepseek-ai/*）保持 require 导入由加载器应答，其余全部内联
+  // 模块表内的包（react、@deepseek-ai/*）保持 require 导入由加载器应答，其余全部内联；
+  // external 用于宿主运行时提供、不该被内联的依赖（如需自签证书支持的 ws）
   const isExternal = (specifier: string): boolean =>
-    specifier === 'react' || specifier === 'react-dom' || specifier.startsWith('@deepseek-ai/')
+    specifier === 'react' ||
+    specifier === 'react-dom' ||
+    specifier.startsWith('@deepseek-ai/') ||
+    (options.external?.includes(specifier) ?? false)
   const deps = {
     neverBundle: (specifier: string) => isBuiltin(specifier) || isExternal(specifier),
     alwaysBundle: (specifier: string) => !isBuiltin(specifier) && !isExternal(specifier),

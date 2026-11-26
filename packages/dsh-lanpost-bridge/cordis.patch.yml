@@ -1,0 +1,4 @@
+# lanpost-im 适配插件的组合行：宿主半与浏览器半同包
+- insert:
+    - id: our-dsh-lanpost-bridge
+      name: '@hllshiro/dsh-lanpost-bridge'

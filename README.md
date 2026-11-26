@@ -32,6 +32,7 @@ pnpm dev        # 注入后启动 dsh web（后台 watch 重建插件）
 |---|---|---|---|
 | `@hllshiro/business-example` | `our-business-example` | host | 业务系统对接插件模板，每个业务系统一个 |
 | `@hllshiro/ui-brand` | `our-ui-brand` | client | 自有品牌呈现（四个品牌 slot） |
+| `@hllshiro/dsh-lanpost-bridge` | `our-dsh-lanpost-bridge` | host+client | DSH ↔ lanpost-im 适配（工具发消息、入站驱动会话、设置页） |
 
 行 id 一律以 `our-` 开头，与官方配置行区分；各插件的机制归属与开发要点见各包 `src/index.ts` 注释与 `AGENTS.md`。
 
