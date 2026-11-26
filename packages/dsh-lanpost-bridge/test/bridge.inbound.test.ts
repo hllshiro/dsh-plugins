@@ -418,6 +418,10 @@ test('队列超过 20 条回排队提示', async () => {
   assert.equal(s.sent.length, 1)
   assert.equal(s.sent[0].text, '我这边还排着 20 条消息，稍后再发。')
   assert.equal(s.audits.filter((entry: any) => entry.detail?.action === 'queue-full').length, 1)
+  // 一条事件只给一个结论：被判满队列丢弃的 e20 不应再记 accepted。
+  const fullEventAudits = s.audits.filter((entry: any) => entry.detail?.eventId === 'e20')
+  assert.equal(fullEventAudits.length, 1)
+  assert.equal(fullEventAudits[0].detail.action, 'queue-full')
   release()
   await Promise.all(tasks)
   assert.equal(s.prompts.length, 20)
@@ -504,6 +508,16 @@ test('bidi 与零宽字符被净化', async () => {
     }),
   )
   assert.equal(s.prompts[0].content[0].text, '[lanpost 私聊 · 张三 管理员 (r1)]\n\n你好')
+})
+
+test('ZWJ 连接的 emoji 不被净化拆散', async () => {
+  const family = '👨\u200D👩\u200D👧'
+  const s = setup()
+  await s.bridge.handleMessage(
+    msg({ sender: { protocolId: 'p1', username: 'u1', displayName: family } }),
+  )
+  assert.equal(s.prompts[0].content[0].text, `[lanpost 私聊 · ${family} (u1)]\n\n你好`)
+  assert.equal(s.renames[0].title, `lanpost · ${family}`)
 })
 
 test('超长显示名按码点截断到 64 个字符', async () => {

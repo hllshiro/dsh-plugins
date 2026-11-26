@@ -167,8 +167,9 @@ export function apply(ctx: Context): void {
         next.enabled !== state.enabled ||
         next.gatewayUrl !== state.gatewayUrl ||
         next.token !== state.token
+      // 先落盘再改内存：写盘失败时内存保持旧值，routes 把异常翻成 500，设置页不会看到「半生效」。
+      saveState(next, home)
       state = next
-      saveState(state, home)
       if (restart) startGateway()
     },
     reconnect: () => {

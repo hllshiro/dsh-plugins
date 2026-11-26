@@ -86,6 +86,29 @@ test('fetchSettings：GET /settings 并解包 settings 字段', async (t) => {
   assert.equal('token' in settings, false, '公开设置不得回显令牌')
 })
 
+test('requestJson：真正的超时中断会转成 BridgeTimeoutError', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const original = globalThis.fetch
+  // 假 fetch 自己不计时，只监听请求信号：只有 abort 真的传到 fetch 才会 reject。
+  globalThis.fetch = ((_input: RequestInfo | URL, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(new DOMException('This operation was aborted', 'AbortError'))
+      })
+    })) as typeof fetch
+  t.after(() => {
+    globalThis.fetch = original
+  })
+
+  const pending = assert.rejects(client.fetchStatus(), (error: unknown) => {
+    assert.ok(error instanceof client.BridgeTimeoutError)
+    assert.equal(error.timeoutMs, 15_000)
+    return true
+  })
+  t.mock.timers.tick(15_000)
+  await pending
+})
+
 test('fetchSettings：也接受裸 PublicSettings，并为缺失字段补默认值', async (t) => {
   installFetch(t, () => ({ body: SAMPLE_SETTINGS }))
   assert.deepEqual(await client.fetchSettings(), SAMPLE_SETTINGS)

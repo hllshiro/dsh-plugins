@@ -190,8 +190,14 @@ const REQUEST_TIMEOUT_MS = 15_000
 async function requestJson(path: string, init?: RequestInit): Promise<unknown> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  // 调用方传了 signal 就并联：任一方中止都会打断请求，本函数的超时仍能转成可读文案。
+  const external = init?.signal
+  const signal =
+    external === undefined || external === null
+      ? controller.signal
+      : AbortSignal.any([controller.signal, external])
   try {
-    const response = await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal })
+    const response = await fetch(`${API_BASE}${path}`, { ...init, signal })
     const payload: unknown = await response.json().catch(() => null)
     if (!response.ok) {
       const message =
@@ -1052,7 +1058,6 @@ function Section(): React.ReactElement {
       h(
         'div',
         { style: styles.statusGrid },
-        h(StatusLine, { label: '最近错误', value: status?.error ?? '无' }),
         h(StatusLine, {
           label: '游标（lastSequence）',
           value: status?.lastSequence === undefined ? '—' : String(status.lastSequence),

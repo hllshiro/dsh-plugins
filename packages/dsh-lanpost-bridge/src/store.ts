@@ -70,7 +70,8 @@ function normalizeState(parsed: Record<string, unknown>): BridgeState {
   const state = freshDefaults()
 
   if (typeof parsed.enabled === 'boolean') state.enabled = parsed.enabled
-  if (typeof parsed.gatewayUrl === 'string') state.gatewayUrl = parsed.gatewayUrl
+  // 与写入侧（mergeSettings）保持一致：载入时也 trim，避免状态页显示带空白的地址。
+  if (typeof parsed.gatewayUrl === 'string') state.gatewayUrl = parsed.gatewayUrl.trim()
   if (typeof parsed.token === 'string') state.token = parsed.token
   if (typeof parsed.workspaceId === 'string' || parsed.workspaceId === null) {
     state.workspaceId = parsed.workspaceId

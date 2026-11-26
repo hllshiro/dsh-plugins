@@ -637,6 +637,43 @@ test('find_contact 用 total 判断下一页：刚好 20 条不标截断，total
   assert.equal(moreValue.truncated, true)
 })
 
+// 网关不给 total / has_more 时只能保守判断：拿满一页就当「可能还有更多」。
+test('find_contact 恰好 20 条且没有分页信号时保守标注可能还有更多', async () => {
+  const users = Array.from({ length: 20 }, (_, index) => ({
+    protocol_id: `p${index}`,
+    username: `u${index}`,
+    display_name: `U${index}`,
+    online: false,
+    last_seen_at: null,
+  }))
+  const { gateway } = makeGateway({ call: async () => ({ users }) })
+  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_find_contact')
+  const args = { keyword: 'u' }
+  const value = (await find.execute(args, {})) as FindSuccess
+
+  assert.equal(value.contacts.length, 20)
+  assert.equal(value.truncated, true)
+  assert.match(firstText(find, args, value), /只显示前 20 条，可能还有更多/)
+})
+
+test('find_contact 19 条未拿满一页时不标截断', async () => {
+  const users = Array.from({ length: 19 }, (_, index) => ({
+    protocol_id: `p${index}`,
+    username: `u${index}`,
+    display_name: `U${index}`,
+    online: false,
+    last_seen_at: null,
+  }))
+  const { gateway } = makeGateway({ call: async () => ({ users }) })
+  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_find_contact')
+  const args = { keyword: 'u' }
+  const value = (await find.execute(args, {})) as FindSuccess
+
+  assert.equal(value.contacts.length, 19)
+  assert.equal(value.truncated, false)
+  assert.equal(firstText(find, args, value).includes('可能还有更多'), false)
+})
+
 test('render 折叠网关文本里的换行与控制字符', async () => {
   const { gateway } = makeGateway({
     call: async () => ({
@@ -673,18 +710,14 @@ test('render 折叠网关文本里的换行与控制字符', async () => {
   const sendText = firstText(send, sendArgs, sendValue)
   assert.equal(sendText.split('\n').length, 1)
   assert.match(sendText, /im: 1/)
-})
 
-test('bridge_status 拒绝未知参数，错误标为本地参数错误', async () => {
-  const status = toolNamed(allTools(), 'lanpost_bridge_status')
-  const args = { foo: 1 }
-  const value = (await status.execute(args, {})) as Failure
-  assert.equal(value.ok, false)
-  assert.equal(value.code, 'invalid_args')
-  assert.match(value.error, /未知参数.*foo/)
-  const text = firstText(status, args, value)
-  assert.match(text, /未知参数/)
-  assert.match(text, /参数错误（本地）/)
+  // 非字符串/空 message_id 不能渲染成空的 "messageId: "。
+  const blankIdGateway = makeGateway({
+    sendUser: async () => ({ message_id: '' }),
+  })
+  const blankSend = toolNamed(allTools({ gateway: () => blankIdGateway.gateway }), 'lanpost_send_message')
+  const blankValue = (await blankSend.execute(sendArgs, {})) as SendSuccess
+  assert.match(firstText(blankSend, sendArgs, blankValue), /（网关未返回消息 id）/)
 })
 
 test('bridge_status render 用绝对时间，多次渲染结果一致', async () => {

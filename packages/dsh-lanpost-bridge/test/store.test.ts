@@ -273,3 +273,13 @@ test('publicSettings 未配置令牌时 tokenSet=false，且不含内部状态�
   assert.equal('sessions' in pub, false)
   assert.equal('seenEventIds' in pub, false)
 })
+
+test('loadState 载入时 trim gatewayUrl，与写入侧一致', () => {
+  const dir = home()
+  writeFileSync(
+    statePath(dir),
+    `${JSON.stringify({ ...DEFAULTS, gatewayUrl: '  wss://127.0.0.1:8443/ws/dsh  ' })}\n`,
+  )
+
+  assert.equal(loadState(dir).gatewayUrl, 'wss://127.0.0.1:8443/ws/dsh')
+})

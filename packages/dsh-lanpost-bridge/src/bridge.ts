@@ -189,9 +189,10 @@ function isBlank(text: string): boolean {
 
 /** 外部可控名字（显示名/用户名/群 id）截断到的最大码点数。 */
 const SOURCE_TEXT_MAX = 64
-/** 控制字符、零宽字符与 bidi 覆盖字符：折叠为空格，防止伪造来源行。 */
+/** 控制字符、零宽字符与 bidi 覆盖字符：折叠为空格，防止伪造来源行。
+ *  U+200D（ZWJ）不在区间内：👨‍👩‍👧 这类 emoji 依赖它连接，净化时不能拆散。 */
 const CONTROL_CHARS =
-  /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u206F]/g
+  /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200C\u200E-\u200F\u202A-\u202E\u2028\u2029\u2060-\u206F]/g
 
 /**
  * 净化要进来源行/会话标题的外部字符串：控制与不可见字符→空格、方括号→空格、
@@ -252,14 +253,6 @@ export class InboundBridge {
     if (!this.rememberSeen(event)) return
     if (this.disposed) return
 
-    this.audit({
-      action: 'accepted',
-      eventId: event.eventId,
-      messageId: event.messageId,
-      conversationType: event.conversationType,
-      textBytes: Buffer.byteLength(plan.text, 'utf8'),
-    })
-
     // 队列已满：不回队列里再排一条提示，直接发出并放弃这条。
     // 判定与占位都在 enqueue 的同步段里完成，不会出现「检查后到入队前」被插队的窗口。
     const queued = this.enqueue(plan.key, async (accepted) => {
@@ -272,10 +265,19 @@ export class InboundBridge {
       await this.process(promptPlan, event, accepted)
     })
     if (queued.kind === 'full') {
+      // 一条事件只给一个结论：满队列就只记 queue-full，不再先记 accepted。
       this.audit({ action: 'queue-full', eventId: event.eventId, key: plan.key })
       await this.reply(plan.target, QUEUE_FULL_NOTICE)
       return
     }
+
+    this.audit({
+      action: 'accepted',
+      eventId: event.eventId,
+      messageId: event.messageId,
+      conversationType: event.conversationType,
+      textBytes: Buffer.byteLength(plan.text, 'utf8'),
+    })
 
     // ACK 只表示「这条事件已被接管」：等 prompt 被接受（waiter 已登记）就返回，
     // 回复由队列在后台继续；但同会话的下一轮仍要等这一轮结算后才投递。

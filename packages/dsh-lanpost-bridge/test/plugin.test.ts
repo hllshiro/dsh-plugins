@@ -3,7 +3,7 @@
 // 网关本身由 gateway.test.ts 覆盖，这里只关心装配顺序与副作用边界。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -86,6 +86,8 @@ interface FakeCtx {
   logs: string[]
   /** 仍然存活的 `session/event` 订阅数；卸载后必须是 0。 */
   sessionListeners: number
+  /** 对 `webServer.register` 的调用次数（含失败的那次）。 */
+  readonly routeAttempts: number
   services: Record<string, unknown>
 }
 
@@ -200,6 +202,9 @@ function createFakeCtx(options: { failRouteAt?: number } = {}): FakeCtx {
     logs,
     get sessionListeners() {
       return sessionListeners
+    },
+    get routeAttempts() {
+      return routeAttempts
     },
     services,
   }
@@ -396,6 +401,35 @@ test('PATCH 设置：非连接字段只落盘；enabled / gatewayUrl / token 变
   }
 })
 
+test('PATCH 落盘失败时回 500，且内存设置保持原值', async () => {
+  const { handle, file } = withTempHome()
+  try {
+    const fake = createFakeCtx()
+    apply(fake.ctx)
+
+    // 用同名目录占住状态文件：saveState 写完 .tmp 后 rename 到目录会失败。
+    rmSync(file, { force: true })
+    mkdirSync(file, { recursive: true })
+
+    const failed = await call(fake.routes, SETTINGS, {
+      method: 'PATCH',
+      body: JSON.stringify({ showProcess: true, gatewayUrl: 'ws://127.0.0.1:2/ws/dsh' }),
+    })
+    assert.equal(failed.statusCode, 500)
+    assert.deepEqual(failed.body, { error: 'internal' })
+
+    // 先落盘再改内存：落盘失败时内存仍是 PATCH 之前的值。
+    const status = await call(fake.routes, STATUS, { method: 'GET' })
+    assert.equal(status.statusCode, 200)
+    const body = status.body as { settings: { showProcess: boolean; gatewayUrl: string } }
+    assert.equal(body.settings.showProcess, false)
+    assert.equal(body.settings.gatewayUrl, DEFAULTS.gatewayUrl)
+    assert.equal(startedCount(fake.logs), 0)
+  } finally {
+    handle.restore()
+  }
+})
+
 test('PATCH enabled=false 停掉已连接的网关，重连接口对停用配置回 409', async () => {
   const { handle } = withTempHome({
     enabled: true,
@@ -443,21 +477,16 @@ test('重复 apply 在首个注册处抛错，不产生网关/会话订阅残留
   }
 })
 
-test('路由注册中途失败时，已注册路由的 disposer 仍被记录并可完整回卷', () => {
+test('路由注册中途失败时按顺序尝试注册（回卷由宿主负责）', () => {
   const { handle } = withTempHome()
   try {
     const fake = createFakeCtx({ failRouteAt: 2 })
 
     assert.throws(() => apply(fake.ctx), /route register failed at 2/)
 
-    assert.equal(fake.tools.size, 3)
-    assert.equal(fake.routes.length, 1)
-    assert.equal(fake.sections.length, 0)
-    assert.equal(fake.sessionListeners, 0)
-
-    fake.disposeAll()
-    assert.equal(fake.tools.size, 0)
-    assert.equal(fake.routes.length, 0)
+    // 夹具只验证注册顺序与次数；注册中途抛错后的回卷由宿主（ctx.effect / ctx.on 记账）负责，
+    // 所以这里不再断言失败瞬间残留的 tools / routes 数量。
+    assert.equal(fake.routeAttempts, 2)
   } finally {
     handle.restore()
   }

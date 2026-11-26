@@ -126,9 +126,10 @@ function gatewayFailure(error: GatewayError): ToolFailure {
   return { ok: false, error: error.message, code: error.code }
 }
 
-/** 与 bridge.ts 的展示净化同源：控制字符折叠成空格，避免网关文本破坏工具输出的行结构。 */
+/** 与 bridge.ts 的展示净化同源：控制字符折叠成空格，避免网关文本破坏工具输出的行结构。
+ *  区间刻意保留 U+200D（ZWJ）：👨‍👩‍👧 这类 emoji 由 ZWJ 连接，删掉就会被拆散。 */
 const CONTROL_CHARS =
-  /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u206F]/g
+  /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200C\u200E-\u200F\u202A-\u202E\u2028\u2029\u2060-\u206F]/g
 const DISPLAY_MAX = 200
 
 function oneLine(value: unknown, max = DISPLAY_MAX): string {
@@ -200,12 +201,12 @@ const SEND_OUTPUT_SCHEMA: Record<string, unknown> = {
     ok: { type: 'boolean', description: '是否成功交给网关发送' },
     messageId: { type: 'string', description: '网关返回的消息 id' },
     deliveryStatus: {
-      anyOf: [{ type: 'string' }, { type: 'null' }],
+      oneOf: [{ type: 'string' }, { type: 'null' }],
       description: '网关返回的投递状态（如 queued/sent）；网关未返回时为 null',
     },
     error: { type: 'string', description: '失败原因' },
     code: {
-      anyOf: [{ type: 'number' }, { type: 'string' }],
+      oneOf: [{ type: 'number' }, { type: 'string' }],
       description: '失败代码：数字为网关错误码，字符串为本地或网关响应检查出的代码',
     },
   },
@@ -314,7 +315,7 @@ function renderSend(args: unknown, value: unknown): Array<{ type: 'text'; text: 
   return [
     {
       type: 'text',
-      text: `已发送到${targetLabel}（messageId: ${oneLine(sent.messageId)}，投递状态：${delivery}）。`,
+      text: `已发送到${targetLabel}（messageId: ${oneLine(sent.messageId) || '（网关未返回消息 id）'}，投递状态：${delivery}）。`,
     },
   ]
 }
@@ -349,7 +350,7 @@ const CONTACT_SCHEMA: Record<string, unknown> = {
     display_name: { type: 'string' },
     online: { type: 'boolean' },
     last_seen_at: {
-      anyOf: [{ type: 'string' }, { type: 'null' }],
+      oneOf: [{ type: 'string' }, { type: 'null' }],
       description: '最近在线时间；未知时为 null',
     },
   },
@@ -369,7 +370,7 @@ const FIND_OUTPUT_SCHEMA: Record<string, unknown> = {
     truncated: { type: 'boolean', description: '是否还有更多匹配结果未返回' },
     error: { type: 'string' },
     code: {
-      anyOf: [{ type: 'number' }, { type: 'string' }],
+      oneOf: [{ type: 'number' }, { type: 'string' }],
       description: '失败代码：数字为网关错误码，字符串为本地或网关响应检查出的代码',
     },
   },
@@ -410,11 +411,15 @@ function projectContact(value: unknown): Contact {
   }
 }
 
-/** 判断 users.list 是否还有下一页：优先信 total，其次 has_more，最后只在超页时保守标注。 */
-function hasNextPage(raw: Record<string, unknown>, shown: number, available: number): boolean {
+/**
+ * 判断 users.list 是否还有下一页：total / has_more 是网关明确给出的分页信号，优先采用；
+ * 两者都缺失时只能保守判断——正好拿满 `CONTACT_LIMIT` 条就认为可能还有更多，
+ * 因为不知道网关是否按 page_size 截断（宁可多提示一句，也不要漏掉联系人）。
+ */
+function hasNextPage(raw: Record<string, unknown>, shown: number): boolean {
   if (typeof raw.total === 'number') return raw.total > shown
-  if (raw.has_more === true) return true
-  return available > CONTACT_LIMIT
+  if (typeof raw.has_more === 'boolean') return raw.has_more
+  return shown >= CONTACT_LIMIT
 }
 
 async function executeFind(deps: ToolsDeps, args: unknown): Promise<unknown> {
@@ -441,7 +446,7 @@ async function executeFind(deps: ToolsDeps, args: unknown): Promise<unknown> {
     const value: FindSuccess = {
       ok: true,
       contacts,
-      truncated: hasNextPage(raw, contacts.length, users.length),
+      truncated: hasNextPage(raw, contacts.length),
     }
     return value
   } catch (error) {
@@ -481,9 +486,9 @@ function renderFind(args: unknown, value: unknown): Array<{ type: 'text'; text: 
       contact.last_seen_at === null ? '' : ` · 最近在线 ${oneLine(contact.last_seen_at)}`
     return `- ${name} · protocol_id: ${oneLine(contact.protocol_id)} · ${state}${lastSeen}`
   })
-  const header = `找到 ${found.contacts.length} 个联系人${found.truncated ? '（已截断）' : ''}：`
+  const header = `找到 ${found.contacts.length} 个联系人${found.truncated ? '（可能还有更多）' : ''}：`
   const footer = found.truncated
-    ? `\n只显示前 ${CONTACT_LIMIT} 条，请用更精确的 keyword 或 online_only 缩小范围。`
+    ? `\n只显示前 ${CONTACT_LIMIT} 条，可能还有更多；请用更精确的 keyword 或 online_only 缩小范围。`
     : ''
   return [{ type: 'text', text: `${header}\n${lines.join('\n')}${footer}` }]
 }
@@ -518,7 +523,7 @@ const STATUS_OUTPUT_SCHEMA: Record<string, unknown> = {
       additionalProperties: false,
     },
     lastSequence: {
-      anyOf: [{ type: 'integer' }, { type: 'null' }],
+      oneOf: [{ type: 'integer' }, { type: 'null' }],
       description: '已 ACK 的最大事件序号；未注入状态时为 null',
     },
     tokenSet: { type: 'boolean', description: '是否已配置令牌（不返回令牌原文）' },
@@ -529,11 +534,11 @@ const STATUS_OUTPUT_SCHEMA: Record<string, unknown> = {
     },
     showProcess: { type: 'boolean', description: '回复是否附带思考与工具摘要' },
     sessions: {
-      anyOf: [{ type: 'integer' }, { type: 'null' }],
+      oneOf: [{ type: 'integer' }, { type: 'null' }],
       description: '已映射的 lanpost 会话数；未注入状态时为 null',
     },
     selfProtocolId: {
-      anyOf: [{ type: 'string' }, { type: 'null' }],
+      oneOf: [{ type: 'string' }, { type: 'null' }],
       description: '本机在 lanpost 的 protocol_id',
     },
   },
@@ -586,16 +591,6 @@ const CONNECTION_LABELS: Record<StatusConnection['state'], string> = {
 }
 
 function renderStatus(_args: unknown, value: unknown): Array<{ type: 'text'; text: string }> {
-  if (isRecord(value) && value.ok === false) {
-    const failed = value as unknown as ToolFailure
-    return [
-      {
-        type: 'text',
-        text: `状态查询失败：${oneLine(failed.error)}\n${codeLabel(failed.code)}`,
-      },
-    ]
-  }
-
   const status = value as StatusValue
   const connection = CONNECTION_LABELS[status.connection.state]
   const since =
@@ -620,15 +615,6 @@ function renderStatus(_args: unknown, value: unknown): Array<{ type: 'text'; tex
     lines.push(`提示：${oneLine(status.connection.notice)}`)
   }
   return [{ type: 'text', text: lines.join('\n') }]
-}
-
-function validateStatusArgs(args: unknown): ToolFailure | undefined {
-  if (!isRecord(args)) return failure('参数必须是对象；lanpost_bridge_status 不接受参数')
-  const extra = unknownKey(args, [])
-  if (extra !== undefined) {
-    return failure(`未知参数：${extra}；lanpost_bridge_status 不接受参数`)
-  }
-  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -659,7 +645,7 @@ export function createTools(deps: ToolsDeps): ToolDefinitionLike[] {
         '查看 lanpost 桥接的连接状态与配置概况：连接状态与上次错误、事件游标、已映射会话数、令牌是否已配置等，用于排查消息发不出或收不到的问题。只读，且不会返回令牌原文。',
       parameters: STATUS_PARAMETERS,
       output: { schema: STATUS_OUTPUT_SCHEMA, render: renderStatus },
-      execute: async (args) => validateStatusArgs(args) ?? buildStatus(deps),
+      execute: async () => buildStatus(deps),
     },
   ]
 }
