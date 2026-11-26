@@ -34,6 +34,11 @@ export interface WorkspaceRegistryService {
   list(): Array<{ id: string; title?: string; path: string }>
 }
 
+/** 提示段注册服务（宿主 `ctx.systemPrompt`）；`section()` 返回 Cordis effect disposer。 */
+export interface SystemPromptService {
+  section(section: { name: string; order: number; text: string }): () => void
+}
+
 /** 工具定义的最小形状：schema、参数、执行与结果渲染。 */
 export interface ToolDefinitionLike {
   name: string
@@ -96,6 +101,13 @@ export function workspaceRegistryOf(ctx: Context): WorkspaceRegistryService {
   const service = (ctx as unknown as { get(name: string): unknown }).get('workspaceRegistry')
   if (!service) throw new Error('lanpost-bridge: service "workspaceRegistry" unavailable')
   return service as WorkspaceRegistryService
+}
+
+/** 取提示段注册服务；宿主没提供就抛错。 */
+export function systemPromptOf(ctx: Context): SystemPromptService {
+  const service = (ctx as unknown as { get(name: string): unknown }).get('systemPrompt')
+  if (!service) throw new Error('lanpost-bridge: service "systemPrompt" unavailable')
+  return service as SystemPromptService
 }
 
 /** 订阅 `session/event`；返回取消订阅的 disposer。 */
