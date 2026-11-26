@@ -49,12 +49,16 @@ function makeState(overrides: Partial<BridgeState> = {}): BridgeState {
   return { ...DEFAULTS, seenEventIds: [], sessions: {}, ...overrides }
 }
 
+function summaryOf(state: BridgeState): { lastSequence: number; sessions: number } {
+  return { lastSequence: state.lastSequence, sessions: Object.keys(state.sessions).length }
+}
+
 function makeDeps(overrides: Partial<ToolsDeps> = {}): ToolsDeps {
   const state = makeState()
   return {
     gateway: () => undefined,
     settings: () => publicSettings(state),
-    state: () => state,
+    state: () => summaryOf(state),
     ...overrides,
   }
 }
@@ -72,7 +76,7 @@ function toolNamed(tools: ToolDefinitionLike[], name: string): ToolDefinitionLik
 interface SendSuccess {
   ok: true
   messageId: string
-  deliveryStatus: string
+  deliveryStatus: string | null
 }
 
 interface Contact {
@@ -479,7 +483,7 @@ test('bridge_status 汇总连接/游标/映射数量，绝不返回令牌原文'
     allTools({
       gateway: () => gateway,
       settings: () => publicSettings(state),
-      state: () => state,
+      state: () => summaryOf(state),
     }),
     'lanpost_bridge_status',
   )
@@ -509,7 +513,7 @@ test('bridge_status 汇总连接/游标/映射数量，绝不返回令牌原文'
 test('bridge_status 未配置/未连接时不抛错，给出可读状态', async () => {
   const state = makeState({ enabled: false, token: '' })
   const status = toolNamed(
-    allTools({ gateway: () => undefined, settings: () => publicSettings(state), state: () => state }),
+    allTools({ gateway: () => undefined, settings: () => publicSettings(state), state: () => summaryOf(state) }),
     'lanpost_bridge_status',
   )
 
@@ -540,7 +544,7 @@ test('bridge_status 暴露上次错误与提示，但仍不含令牌', async () 
     allTools({
       gateway: () => gateway,
       settings: () => publicSettings(state),
-      state: () => state,
+      state: () => summaryOf(state),
     }),
     'lanpost_bridge_status',
   )
@@ -569,4 +573,130 @@ test('bridge_status 在未注入 state 时用 null 表示未知，不编造数�
   assert.equal(value.lastSequence, null)
   assert.equal(value.sessions, null)
   assert.match(firstText(status, {}, value), /未知/)
+})
+
+test('网关未返回投递状态时 deliveryStatus=null，render 明确说明而不伪装成状态值', async () => {
+  const { gateway } = makeGateway({
+    sendUser: async () => ({ message_id: 'im:3', delivery_status: '' }),
+  })
+  const send = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_send_message')
+  const args = { target: 'user', protocol_id: 'p1', content: 'hi' }
+
+  const value = (await send.execute(args, {})) as SendSuccess
+
+  assert.equal(value.deliveryStatus, null)
+  const text = firstText(send, args, value)
+  assert.match(text, /网关未返回投递状态/)
+  assert.equal(text.includes('unknown'), false)
+})
+
+test('本地错误不被标成网关错误码，bad_response 也单独命名', async () => {
+  const send = toolNamed(allTools(), 'lanpost_send_message')
+  const sendArgs = { target: 'user', protocol_id: 'p1', content: 'hi' }
+  const notConnected = (await send.execute(sendArgs, {})) as Failure
+  const notConnectedText = firstText(send, sendArgs, notConnected)
+  assert.match(notConnectedText, /本地/)
+  assert.equal(notConnectedText.includes('网关错误码'), false)
+
+  const find = toolNamed(allTools(), 'lanpost_find_contact')
+  const findArgs = { keyword: '   ' }
+  const invalid = (await find.execute(findArgs, {})) as Failure
+  const invalidText = firstText(find, findArgs, invalid)
+  assert.match(invalidText, /参数错误（本地）/)
+  assert.equal(invalidText.includes('网关错误码'), false)
+
+  const bad = makeGateway({ call: async () => ({ unexpected: true }) })
+  const badFind = toolNamed(allTools({ gateway: () => bad.gateway }), 'lanpost_find_contact')
+  const badArgs = { keyword: 'u' }
+  const badValue = (await badFind.execute(badArgs, {})) as Failure
+  const badText = firstText(badFind, badArgs, badValue)
+  assert.match(badText, /响应格式异常（网关返回）/)
+  assert.equal(badText.includes('网关错误码'), false)
+})
+
+test('find_contact 用 total 判断下一页：刚好 20 条不标截断，total 更大才标', async () => {
+  const users = (count: number) =>
+    Array.from({ length: count }, (_, index) => ({
+      protocol_id: `p${index}`,
+      username: `u${index}`,
+      display_name: `U${index}`,
+      online: false,
+      last_seen_at: null,
+    }))
+
+  const exact = makeGateway({ call: async () => ({ total: 20, users: users(20) }) })
+  const exactFind = toolNamed(allTools({ gateway: () => exact.gateway }), 'lanpost_find_contact')
+  const exactValue = (await exactFind.execute({ keyword: 'u' }, {})) as FindSuccess
+  assert.equal(exactValue.contacts.length, 20)
+  assert.equal(exactValue.truncated, false)
+
+  const more = makeGateway({ call: async () => ({ total: 25, users: users(20) }) })
+  const moreFind = toolNamed(allTools({ gateway: () => more.gateway }), 'lanpost_find_contact')
+  const moreValue = (await moreFind.execute({ keyword: 'u' }, {})) as FindSuccess
+  assert.equal(moreValue.contacts.length, 20)
+  assert.equal(moreValue.truncated, true)
+})
+
+test('render 折叠网关文本里的换行与控制字符', async () => {
+  const { gateway } = makeGateway({
+    call: async () => ({
+      users: [
+        {
+          protocol_id: 'p\u0000evil',
+          username: 'u\nname',
+          display_name: 'bad\u0000display\nname',
+          online: false,
+          last_seen_at: '2026-01-01\nT00:00:00Z',
+        },
+      ],
+    }),
+  })
+  const find = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_find_contact')
+  const args = { keyword: 'bad' }
+  const value = (await find.execute(args, {})) as FindSuccess
+  const text = firstText(find, args, value)
+
+  assert.equal(text.includes('\u0000'), false)
+  assert.match(text, /bad display name/)
+  assert.match(text, /u name/)
+  assert.equal(text.split('\n').length, 2)
+  for (const line of text.split('\n')) {
+    assert.equal(/[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/.test(line), false)
+  }
+
+  const sendGateway = makeGateway({
+    sendUser: async () => ({ message_id: 'im:\n1', delivery_status: 'queued\nok' }),
+  })
+  const send = toolNamed(allTools({ gateway: () => sendGateway.gateway }), 'lanpost_send_message')
+  const sendArgs = { target: 'user', protocol_id: 'p1', content: 'hi' }
+  const sendValue = (await send.execute(sendArgs, {})) as SendSuccess
+  const sendText = firstText(send, sendArgs, sendValue)
+  assert.equal(sendText.split('\n').length, 1)
+  assert.match(sendText, /im: 1/)
+})
+
+test('bridge_status 拒绝未知参数，错误标为本地参数错误', async () => {
+  const status = toolNamed(allTools(), 'lanpost_bridge_status')
+  const args = { foo: 1 }
+  const value = (await status.execute(args, {})) as Failure
+  assert.equal(value.ok, false)
+  assert.equal(value.code, 'invalid_args')
+  assert.match(value.error, /未知参数.*foo/)
+  const text = firstText(status, args, value)
+  assert.match(text, /未知参数/)
+  assert.match(text, /参数错误（本地）/)
+})
+
+test('bridge_status render 用绝对时间，多次渲染结果一致', async () => {
+  const gateway = makeGateway().gateway
+  const status = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_bridge_status')
+  const value = (await status.execute({}, {})) as StatusValue
+  const first = firstText(status, {}, value)
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  const second = firstText(status, {}, value)
+
+  assert.equal(first, second)
+  assert.equal(first.includes('已持续'), false)
+  assert.equal(first.includes('距上次变化'), false)
+  assert.ok(first.includes(new Date(1_700_000_000_000).toISOString()))
 })

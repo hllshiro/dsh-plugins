@@ -18,6 +18,7 @@ import type { SessionEventLike } from './harness.ts'
 import type { BridgeState } from './store.ts'
 
 // Task 7 从本文件消费会话事件类型；定义只有 harness.ts 一份，这里只再导出。
+/** 会话事件类型（定义在 harness.ts，这里为桥接使用方转发）。 */
 export type { SessionEventLike }
 
 /** 私聊回退文案：v1 只处理文本。 */
@@ -97,6 +98,7 @@ const GROUP_PREFIX = 'group:'
 /** 发消息的目标（与网关 `sendUser` / `sendGroup` 一一对应）。 */
 export type ReplyTarget = { kind: 'user'; protocolId: string } | { kind: 'group'; groupId: string }
 
+/** 入站桥依赖的宿主能力：状态读写、会话控制、发送、事件订阅与日志/审计。 */
 export interface InboundDeps {
   state(): BridgeState
   update(mutate: (state: BridgeState) => void): void
@@ -259,16 +261,8 @@ export class InboundBridge {
     })
 
     // 队列已满：不回队列里再排一条提示，直接发出并放弃这条。
-    const slot = this.queues.get(plan.key)
-    if (slot && slot.pending >= QUEUE_LIMIT) {
-      this.audit({ action: 'queue-full', eventId: event.eventId, key: plan.key })
-      await this.reply(plan.target, QUEUE_FULL_NOTICE)
-      return
-    }
-
-    // ACK 只表示「这条事件已被接管」：等 prompt 被接受（waiter 已登记）就返回，
-    // 回复由队列在后台继续；但同会话的下一轮仍要等这一轮结算后才投递。
-    await this.enqueue(plan.key, async (accepted) => {
+    // 判定与占位都在 enqueue 的同步段里完成，不会出现「检查后到入队前」被插队的窗口。
+    const queued = this.enqueue(plan.key, async (accepted) => {
       if (plan.kind === 'notice') {
         const notice: NoticePlan = plan
         await this.reply(notice.target, notice.text)
@@ -277,6 +271,15 @@ export class InboundBridge {
       const promptPlan: PromptPlan = plan
       await this.process(promptPlan, event, accepted)
     })
+    if (queued.kind === 'full') {
+      this.audit({ action: 'queue-full', eventId: event.eventId, key: plan.key })
+      await this.reply(plan.target, QUEUE_FULL_NOTICE)
+      return
+    }
+
+    // ACK 只表示「这条事件已被接管」：等 prompt 被接受（waiter 已登记）就返回，
+    // 回复由队列在后台继续；但同会话的下一轮仍要等这一轮结算后才投递。
+    await queued.accepted
   }
 
   /** 出站投递回执；v1 只把它写日志与审计，不回聊天。 */
@@ -570,16 +573,22 @@ export class InboundBridge {
 
   /**
    * 把任务排进会话键的串行链，返回「调用方可以放行 ACK」的 promise。
+   * 满额判定与 `pending` 自增在同一个同步段内完成，并发调用不会插到两者之间；
+   * 满额时返回 `full`，调用方负责回排队提示且不占用队列。
    * `accepted` 由任务自己在该轮 prompt 被接受后调用；任务本身继续跑完整轮
    * （含回复发送），链尾才会前进，从而保住同会话串行。
    */
-  private enqueue(key: string, task: (accepted: () => void) => Promise<void>): Promise<void> {
+  private enqueue(
+    key: string,
+    task: (accepted: () => void) => Promise<void>,
+  ): { kind: 'full' } | { kind: 'queued'; accepted: Promise<void> } {
     let slot = this.queues.get(key)
     if (!slot) {
       slot = { pending: 0, tail: Promise.resolve() }
       this.queues.set(key, slot)
     }
     const current = slot
+    if (current.pending >= QUEUE_LIMIT) return { kind: 'full' }
     current.pending += 1
 
     let markAccepted: () => void = () => {}
@@ -605,7 +614,7 @@ export class InboundBridge {
 
     const chain = current.tail.then(run, run)
     current.tail = chain
-    return accepted
+    return { kind: 'queued', accepted }
   }
 
   // ── 处理 ────────────────────────────────────────────────────────────────

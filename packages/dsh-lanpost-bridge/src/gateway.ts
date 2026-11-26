@@ -8,8 +8,10 @@ import { randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
 import { SEEN_LIMIT, TEXT_MAX_BYTES, dedupeAdd } from './core.ts'
 
+/** 网关连接状态机的四种状态。 */
 export type GatewayState = 'idle' | 'connecting' | 'connected' | 'error'
 
+/** 网关状态快照：当前状态、进入该状态的时间与可选的错误/提示。 */
 export interface GatewayStatus {
   state: GatewayState
   since: number
@@ -19,16 +21,19 @@ export interface GatewayStatus {
   notice?: string
 }
 
+/** 入站消息发送者在本适配层需要的最小信息。 */
 export interface InboundSender {
   protocolId: string
   username: string
   displayName: string
 }
 
+/** 入站内容：v1 只处理文本，图片类型保留给上层明确拒绝。 */
 export type InboundContent =
   | { type: 'text'; text: string }
   | { type: 'image'; mimeType: string; name: string }
 
+/** 网关推送的入站消息（字段已归一化，可直接用于去重与会话映射）。 */
 export interface InboundMessage {
   eventId: string
   sequence: number
@@ -41,12 +46,14 @@ export interface InboundMessage {
   timestamp: string
 }
 
+/** 投递状态事件；reason 为失败原因（成功时通常为空）。 */
 export interface DeliveryStatus {
   messageId: string
   status: string
   reason?: string
 }
 
+/** 网关心跳回调集合；onMessage/onDelivery 可异步，用于处理完成后再 ACK。 */
 export interface GatewayEvents {
   /** 可以返回 Promise：处理持久化完成之前不会 ACK。 */
   onMessage?: (message: InboundMessage) => void | Promise<void>
@@ -56,12 +63,14 @@ export interface GatewayEvents {
   onAck?: (sequence: number) => void
 }
 
+/** 传输层最小接口：真实 WebSocket 或测试注入的假实现都满足它。 */
 export interface GatewayTransport {
   send(data: string): void
   close(code?: number, reason?: string): void
   on(event: 'open' | 'close' | 'message' | 'error', listener: (arg: any) => void): void
 }
 
+/** 创建网关所需的参数：地址、令牌、游标、回调与可选的测试传输。 */
 export interface GatewayOptions {
   url: string
   token: string
@@ -78,11 +87,13 @@ export interface GatewayOptions {
   reconnectMaxMs?: number
 }
 
+/** message.sendUser / message.sendGroup 的返回；delivery_status 可能缺失。 */
 export interface SendResult {
   message_id: string
   delivery_status?: string
 }
 
+/** 网关 JSON-RPC 错误：code 为网关错误码，data 原样保留。 */
 export class GatewayError extends Error {
   readonly code: number
   readonly data?: unknown
@@ -130,6 +141,7 @@ export function backoffDelay(
   return Math.round(Math.min(maxMs, base - jitter + random() * jitter * 2))
 }
 
+/** 建真实 WebSocket 传输；仅用于本机/内网网关，因此不校验对端证书。 */
 export function createTransport(url: string): GatewayTransport {
   const socket = new WebSocket(url, { rejectUnauthorized: false, handshakeTimeout: 10_000 })
   return {
@@ -190,6 +202,7 @@ function parseSendResult(result: unknown): SendResult {
   return parsed
 }
 
+/** 单个网关连接的完整客户端：登录、订阅、恢复、ACK 推进与退避重连。 */
 export class LanpostGateway {
   private readonly url: string
   private readonly token: string

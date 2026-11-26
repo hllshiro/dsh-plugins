@@ -12,7 +12,7 @@ import {
   createRoutes,
 } from '../src/routes.ts'
 import type { RouteDeps } from '../src/routes.ts'
-import { DEFAULTS } from '../src/store.ts'
+import { DEFAULTS, publicSettings } from '../src/store.ts'
 import type { BridgeState } from '../src/store.ts'
 import type { WebRouteLike } from '../src/harness.ts'
 
@@ -239,6 +239,38 @@ test('PATCH 忽略类型不符的白名单字段', async () => {
   assert.deepEqual(h.patches, [])
 })
 
+test('PATCH 忽略继承属性：原型被污染时也不会进入 patch', async () => {
+  const h = harness()
+  const polluted: Record<string, unknown> = {
+    enabled: true,
+    gatewayUrl: 'wss://evil.example/ws',
+    workspaceId: 'w-evil',
+    workspacePath: 'D:/evil',
+    selfProtocolId: 'evil',
+    sessionMode: 'new',
+    showProcess: true,
+    token: 'evil-token',
+  }
+  try {
+    for (const [key, value] of Object.entries(polluted)) {
+      Object.defineProperty(Object.prototype, key, { value, configurable: true, writable: true })
+    }
+    const res = await call(h.routes, SETTINGS, {
+      method: 'PATCH',
+      url: SETTINGS,
+      body: JSON.stringify({ pad: 1 }),
+    })
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(h.patches, [])
+    assert.equal(h.state.token, 'secret')
+    assert.equal(h.state.sessionMode, 'continue')
+  } finally {
+    for (const key of Object.keys(polluted)) {
+      delete (Object.prototype as Record<string, unknown>)[key]
+    }
+  }
+})
+
 test('PATCH 非法 JSON / 非对象 JSON / 空体一律 400', async () => {
   for (const body of ['{oops', '[]', 'null', '42', '']) {
     const h = harness()
@@ -307,6 +339,28 @@ test('reconnect 成功返回 ok 与网关状态', async () => {
   assert.equal(h.reconnects(), 1)
 })
 
+test('reconnect 响应只带网关状态的已知字段', async () => {
+  const h = harness({
+    status: () => ({
+      state: 'connected',
+      since: 123,
+      lastSequence: 9,
+      error: 'boom',
+      notice: 'hi',
+      token: 'secret',
+    }),
+  })
+  h.state.enabled = true
+  const res = await call(h.routes, RECONNECT, { method: 'POST', url: RECONNECT })
+  assert.equal(res.statusCode, 200)
+  const body = res.body as { ok: boolean; status: Record<string, unknown> }
+  assert.deepEqual(body, {
+    ok: true,
+    status: { state: 'connected', since: 123, lastSequence: 9, error: 'boom', notice: 'hi' },
+  })
+  assert.equal(res.raw.includes('secret'), false)
+})
+
 test('status 合并网关状态、sessions 与 settings', async () => {
   const h = harness()
   h.state.sessions['direct:p1'] = { sessionId: 's1', updatedAt: '2026-11-26T00:00:00.000Z' }
@@ -320,23 +374,43 @@ test('status 合并网关状态、sessions 与 settings', async () => {
   assert.equal('token' in (body.settings as object), false)
 })
 
+test('status 只展开已知字段，未来新增的敏感字段不外泄', async () => {
+  const h = harness({
+    status: () => ({ state: 'connected', since: 123, token: 'secret', lastSequence: 7 }),
+  })
+  const res = await call(h.routes, STATUS, { method: 'GET', url: STATUS })
+  assert.equal(res.statusCode, 200)
+  const body = res.body as Record<string, unknown>
+  assert.deepEqual(body, {
+    state: 'connected',
+    since: 123,
+    lastSequence: 7,
+    sessions: {},
+    settings: publicSettings(h.state),
+  })
+  assert.equal(res.raw.includes('secret'), false)
+})
+
 test('workspaces 返回注入的工作区列表', async () => {
   const res = await call(harness().routes, WORKSPACES, { method: 'GET', url: WORKSPACES })
   assert.equal(res.statusCode, 200)
   assert.deepEqual(res.body, { workspaces: [{ id: 'w1', title: 'demo', path: 'D:/demo' }] })
 })
 
-test('workspaces 抛错冒泡为 500 并记日志', async () => {
+test('workspaces 抛错冒泡为 500，日志只记方法与路径（不含 query 与下游 message）', async () => {
   const h = harness({
     workspaces: () => {
-      throw new Error('registry down')
+      throw new Error('registry down token=secret')
     },
   })
-  const res = await call(h.routes, WORKSPACES, { method: 'GET', url: WORKSPACES })
+  const res = await call(h.routes, WORKSPACES, {
+    method: 'GET',
+    url: `${WORKSPACES}?token=secret`,
+  })
   assert.equal(res.statusCode, 500)
   assert.deepEqual(res.body, { error: 'internal' })
-  assert.equal(h.logs.length, 1)
-  assert.match(h.logs[0]!, /registry down/)
+  assert.deepEqual(h.logs, ['lanpost-bridge route GET /api/lanpost-bridge/workspaces failed'])
+  assert.equal(h.logs[0]!.includes('secret'), false)
 })
 
 test('DELETE 已存在的会话键：removed true，键按 URL 解码', async () => {
@@ -396,6 +470,7 @@ test('意外异常统一 500 internal，响应不回显异常内容', async () =
   assert.deepEqual(res.body, { error: 'internal' })
   assert.equal(h.logs.length, 1)
   assert.equal(res.raw.includes('secret'), false)
+  assert.deepEqual(h.logs, ['lanpost-bridge route PATCH /api/lanpost-bridge/settings failed'])
 })
 
 test('PATCH 审计只记改了哪些键，不含值', async () => {

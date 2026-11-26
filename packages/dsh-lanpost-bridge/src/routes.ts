@@ -8,10 +8,15 @@ import type { BridgeState } from './store.ts'
 
 /** 一条路由的完整路径都建立在这个前缀上。 */
 export const BASE = '/api/lanpost-bridge'
+/** 设置读写。 */
 export const SETTINGS = `${BASE}/settings`
+/** 网关状态快照。 */
 export const STATUS = `${BASE}/status`
+/** 可选工作区列表。 */
 export const WORKSPACES = `${BASE}/workspaces`
+/** 手动重连。 */
 export const RECONNECT = `${BASE}/reconnect`
+/** 会话映射（前缀路由，DELETE 到 `/sessions/<key>`）。 */
 export const SESSIONS = `${BASE}/sessions`
 
 /** 设置页请求体上限：设置项都是短字符串，1 MiB 远够用，防止被灌爆内存。 */
@@ -24,12 +29,21 @@ export interface WorkspaceEntry {
   path: string
 }
 
+/** 网关状态里允许回给浏览器的字段；其余字段（未来可能出现的敏感值）一律丢弃。 */
+export interface RouteStatus {
+  state: string
+  since?: number
+  error?: string
+  notice?: string
+  lastSequence?: number
+}
+
 /** 路由取数据的接缝；设置页只读，真正的落盘、重连、清映射由 index 组合时提供。 */
 export interface RouteDeps {
   state(): BridgeState
   patch(patch: Record<string, unknown>): Promise<void> | void
   reconnect(): void | Promise<void>
-  /** 网关状态，原样展开进 GET /status 的响应。 */
+  /** 网关状态；响应只投影 `RouteStatus` 的已知字段。 */
   status(): object
   workspaces(): WorkspaceEntry[] | Promise<WorkspaceEntry[]>
   clearSession(key: string): void
@@ -117,31 +131,59 @@ function nullIfEmpty(value: string): string | null {
   return value === '' ? null : value
 }
 
+/** 只读取对象自身的键；继承来的属性（含被污染的原型）一律视为未提供。 */
+function own(input: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(input, key) ? input[key] : undefined
+}
+
 /** 只保留白名单键，并做路由边界的两处归一：空字符串路径 → null，令牌 trim 后为空表示不改。 */
 function cleanSettingsPatch(input: Record<string, unknown>): Record<string, unknown> {
   const patch: Record<string, unknown> = {}
-  if (typeof input.enabled === 'boolean') patch.enabled = input.enabled
-  if (typeof input.gatewayUrl === 'string') patch.gatewayUrl = input.gatewayUrl
-  if (input.workspaceId === null) patch.workspaceId = null
-  else if (typeof input.workspaceId === 'string') patch.workspaceId = nullIfEmpty(input.workspaceId)
-  if (input.workspacePath === null) patch.workspacePath = null
-  else if (typeof input.workspacePath === 'string') {
-    patch.workspacePath = nullIfEmpty(input.workspacePath)
+  const enabled = own(input, 'enabled')
+  if (typeof enabled === 'boolean') patch.enabled = enabled
+  const gatewayUrl = own(input, 'gatewayUrl')
+  if (typeof gatewayUrl === 'string') patch.gatewayUrl = gatewayUrl
+  const workspaceId = own(input, 'workspaceId')
+  if (workspaceId === null) patch.workspaceId = null
+  else if (typeof workspaceId === 'string') patch.workspaceId = nullIfEmpty(workspaceId)
+  const workspacePath = own(input, 'workspacePath')
+  if (workspacePath === null) patch.workspacePath = null
+  else if (typeof workspacePath === 'string') {
+    patch.workspacePath = nullIfEmpty(workspacePath)
   }
-  if (typeof input.selfProtocolId === 'string') {
-    patch.selfProtocolId = nullIfEmpty(input.selfProtocolId)
-  } else if (input.selfProtocolId === null) {
+  const selfProtocolId = own(input, 'selfProtocolId')
+  if (typeof selfProtocolId === 'string') {
+    patch.selfProtocolId = nullIfEmpty(selfProtocolId)
+  } else if (selfProtocolId === null) {
     patch.selfProtocolId = null
   }
-  if (input.sessionMode === 'continue' || input.sessionMode === 'new') {
-    patch.sessionMode = input.sessionMode
+  const sessionMode = own(input, 'sessionMode')
+  if (sessionMode === 'continue' || sessionMode === 'new') {
+    patch.sessionMode = sessionMode
   }
-  if (typeof input.showProcess === 'boolean') patch.showProcess = input.showProcess
-  if (typeof input.token === 'string') {
-    const token = input.token.trim()
-    if (token !== '') patch.token = token
+  const showProcess = own(input, 'showProcess')
+  if (typeof showProcess === 'boolean') patch.showProcess = showProcess
+  const token = own(input, 'token')
+  if (typeof token === 'string') {
+    const trimmed = token.trim()
+    if (trimmed !== '') patch.token = trimmed
   }
   return patch
+}
+
+/** 从网关状态里只挑已知字段，避免未来新增的敏感字段被整体展开到 HTTP 响应。 */
+function pickStatus(status: object): RouteStatus {
+  const record = isRecord(status) ? status : {}
+  const state = record.state
+  if (typeof state !== 'string') {
+    throw new Error('lanpost-bridge route status is missing state')
+  }
+  const picked: RouteStatus = { state }
+  if (typeof record.since === 'number') picked.since = record.since
+  if (typeof record.error === 'string') picked.error = record.error
+  if (typeof record.notice === 'string') picked.notice = record.notice
+  if (typeof record.lastSequence === 'number') picked.lastSequence = record.lastSequence
+  return picked
 }
 
 function requestPath(req: IncomingMessage): string {
@@ -193,8 +235,8 @@ function makeRoute(
           writeJson(res, error.statusCode, { error: error.code })
           return
         }
-        const message = error instanceof Error ? error.message : String(error)
-        deps.log?.(`lanpost-bridge route ${req.method ?? ''} ${req.url ?? ''} failed: ${message}`)
+        // 只记方法与路径：query 里可能有令牌，下游 message 也可能回显敏感内容。
+        deps.log?.(`lanpost-bridge route ${req.method ?? ''} ${requestPath(req)} failed`)
         writeJson(res, 500, { error: 'internal' })
       }
     },
@@ -233,7 +275,7 @@ export function createRoutes(deps: RouteDeps): WebRouteLike[] {
           return
         }
         await deps.reconnect()
-        writeJson(res, 200, { ok: true, status: deps.status() })
+        writeJson(res, 200, { ok: true, status: pickStatus(deps.status()) })
       },
       deps,
     ),
@@ -244,7 +286,7 @@ export function createRoutes(deps: RouteDeps): WebRouteLike[] {
       (_req, res) => {
         const state = deps.state()
         writeJson(res, 200, {
-          ...deps.status(),
+          ...pickStatus(deps.status()),
           sessions: state.sessions,
           settings: publicSettings(state),
         })

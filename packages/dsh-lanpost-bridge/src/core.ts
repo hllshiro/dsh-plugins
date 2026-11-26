@@ -15,8 +15,10 @@ export const SEEN_LIMIT = 500
 /** 群触发前缀：`/dsh` 后跟空白或字符串结束。 */
 export const GROUP_TRIGGER = /^\/dsh(?:\s+|$)/i
 
+/** 消息来源类型：私聊或群聊。 */
 export type SourceKind = 'private' | 'group'
 
+/** 回复目标来源：私聊需要 protocolId，群聊需要 groupId。 */
 export interface ReplySource {
   kind: SourceKind
   name: string
@@ -88,8 +90,14 @@ export function dedupeAdd(
   return { list: [id, ...list].slice(0, limit), added: true }
 }
 
-/** 人类可读时长：< 1 分钟 `12.3s`，否则 `1m 5s`。 */
+/** 人类可读时长：< 1 分钟 `12.3s`，否则 `1m 5s`；秒进位到分钟，不出现 `59m 60s`。 */
 export function formatDuration(ms: number): string {
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
-  return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`
+  let minutes = Math.floor(ms / 60_000)
+  let seconds = Math.round((ms % 60_000) / 1000)
+  if (seconds === 60) {
+    minutes += 1
+    seconds = 0
+  }
+  return `${minutes}m ${seconds}s`
 }

@@ -90,13 +90,14 @@ interface FakeCtx {
 }
 
 /** 假上下文：只实现 index.ts 用到的宿主面，重复注册（工具名、路由 (kind,path)）直接抛错。 */
-function createFakeCtx(): FakeCtx {
+function createFakeCtx(options: { failRouteAt?: number } = {}): FakeCtx {
   const disposers: Array<() => void> = []
   const tools = new Map<string, ToolDefinitionLike>()
   const routes: WebRouteLike[] = []
   const sections: RegisteredSection[] = []
   const logs: string[] = []
   let sessionListeners = 0
+  let routeAttempts = 0
 
   const log = (message: string) => {
     logs.push(message)
@@ -116,6 +117,10 @@ function createFakeCtx(): FakeCtx {
     },
     webServer: {
       register(route: WebRouteLike) {
+        routeAttempts += 1
+        if (options.failRouteAt === routeAttempts) {
+          throw new Error(`route register failed at ${routeAttempts}`)
+        }
         if (routes.some((item) => item.kind === route.kind && item.path === route.path)) {
           throw new Error(`duplicate route ${route.kind} ${route.path}`)
         }
@@ -276,7 +281,8 @@ test('装配：3 个工具、5 条路由、1 段提示；未配置时不启网�
 
     assert.equal(startedCount(fake.logs), 0)
     assert.ok(fake.logs.some((line) => line.includes('gateway skipped')))
-    assert.equal(fake.sessionListeners, 1)
+    // 入站桥延迟到网关真正启动才创建；未配置时不订阅会话事件。
+    assert.equal(fake.sessionListeners, 0)
   } finally {
     handle.restore()
   }
@@ -297,9 +303,14 @@ test('enabled=false：配置了地址与令牌也不启网关，状态保持 idl
 
     const response = await call(fake.routes, STATUS, { method: 'GET' })
     assert.equal(response.statusCode, 200)
-    const body = response.body as { state: string; settings: { tokenSet: boolean } }
+    const body = response.body as { state: string; since: number; settings: { tokenSet: boolean } }
     assert.equal(body.state, 'idle')
     assert.equal(body.settings.tokenSet, true)
+    // 启动被跳过也是一次状态变化：since 是本次进入 idle 的时刻，不是进程启动时的旧值。
+    const now = Date.now()
+    assert.ok(body.since <= now)
+    assert.ok(body.since >= now - 10_000)
+    assert.equal(fake.sessionListeners, 0)
 
     // 任何日志都不得带令牌原文。
     assert.ok(fake.logs.every((line) => !line.includes('hidden-token')))
@@ -313,9 +324,9 @@ test('卸载回卷：工具、路由、会话订阅与提示段全部清空', ()
   try {
     const fake = createFakeCtx()
     apply(fake.ctx)
-    // 5 个 effect（网关 + 3 工具 + 路由）+ 1 个提示段注册。
-    assert.equal(fake.disposers.length, 6)
-    assert.equal(fake.sessionListeners, 1)
+    // 3 工具 + 5 路由（逐条 effect）+ 网关 effect + 1 个提示段注册。
+    assert.equal(fake.disposers.length, 10)
+    assert.equal(fake.sessionListeners, 0)
 
     fake.disposeAll()
 
@@ -342,7 +353,7 @@ test('卸载后重新 apply 能完整重装配（注册表无残留、无重复�
     assert.deepEqual([...fake.tools.keys()].sort(), TOOL_NAMES)
     assert.equal(fake.routes.length, 5)
     assert.equal(fake.sections.length, 1)
-    assert.equal(fake.sessionListeners, 1)
+    assert.equal(fake.sessionListeners, 0)
   } finally {
     handle.restore()
   }
@@ -407,6 +418,91 @@ test('PATCH enabled=false 停掉已连接的网关，重连接口对停用配置
     const reconnect = await call(fake.routes, RECONNECT, { method: 'POST' })
     assert.equal(reconnect.statusCode, 409)
     assert.deepEqual(reconnect.body, { error: 'not-configured' })
+  } finally {
+    handle.restore()
+  }
+})
+
+test('重复 apply 在首个注册处抛错，不产生网关/会话订阅残留', () => {
+  const { handle } = withTempHome()
+  try {
+    const fake = createFakeCtx()
+    apply(fake.ctx)
+    const disposers = fake.disposers.length
+
+    assert.throws(() => apply(fake.ctx), /duplicate tool/)
+
+    assert.equal(fake.tools.size, 3)
+    assert.equal(fake.routes.length, 5)
+    assert.equal(fake.sections.length, 1)
+    assert.equal(fake.disposers.length, disposers)
+    assert.equal(fake.sessionListeners, 0)
+    assert.equal(startedCount(fake.logs), 0)
+  } finally {
+    handle.restore()
+  }
+})
+
+test('路由注册中途失败时，已注册路由的 disposer 仍被记录并可完整回卷', () => {
+  const { handle } = withTempHome()
+  try {
+    const fake = createFakeCtx({ failRouteAt: 2 })
+
+    assert.throws(() => apply(fake.ctx), /route register failed at 2/)
+
+    assert.equal(fake.tools.size, 3)
+    assert.equal(fake.routes.length, 1)
+    assert.equal(fake.sections.length, 0)
+    assert.equal(fake.sessionListeners, 0)
+
+    fake.disposeAll()
+    assert.equal(fake.tools.size, 0)
+    assert.equal(fake.routes.length, 0)
+  } finally {
+    handle.restore()
+  }
+})
+
+test('建连前 trim gatewayUrl，日志与网关地址都是去掉首尾空白后的值', () => {
+  const { handle } = withTempHome({
+    enabled: true,
+    gatewayUrl: '  ws://127.0.0.1:1/ws/dsh  ',
+    token: 'hidden-token',
+  })
+  try {
+    const fake = createFakeCtx()
+    apply(fake.ctx)
+
+    assert.equal(startedCount(fake.logs), 1)
+    assert.ok(fake.logs.some((line) => line.includes('gateway started (ws://127.0.0.1:1/ws/dsh)')))
+    assert.ok(fake.logs.every((line) => !line.includes('started (  ')))
+    assert.equal(fake.sessionListeners, 1)
+  } finally {
+    handle.restore()
+  }
+})
+
+test('停用网关后 status().since 刷新为停止时刻，而不是启动时刻', async () => {
+  const { handle } = withTempHome({
+    enabled: true,
+    gatewayUrl: 'ws://127.0.0.1:1/ws/dsh',
+    token: 'hidden-token',
+  })
+  try {
+    const fake = createFakeCtx()
+    apply(fake.ctx)
+
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const beforeStop = Date.now()
+    await call(fake.routes, SETTINGS, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled: false }),
+    })
+    const response = await call(fake.routes, STATUS, { method: 'GET' })
+    const body = response.body as { state: string; since: number }
+    assert.equal(body.state, 'idle')
+    assert.ok(body.since >= beforeStop)
+    assert.ok(body.since <= Date.now())
   } finally {
     handle.restore()
   }

@@ -130,4 +130,7 @@ test('formatDuration 边界', () => {
   assert.equal(formatDuration(59999), '60.0s')
   assert.equal(formatDuration(60000), '1m 0s')
   assert.equal(formatDuration(3600000), '60m 0s')
+  // 59m59.999s 四舍五入到 60 秒时要进位成 60m，不能输出 `59m 60s`。
+  assert.equal(formatDuration(3599999), '60m 0s')
+  assert.equal(formatDuration(119999), '2m 0s')
 })

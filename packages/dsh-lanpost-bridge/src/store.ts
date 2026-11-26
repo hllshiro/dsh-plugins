@@ -1,6 +1,6 @@
 // lanpost-bridge 唯一持久化模块：状态文件读写、默认值、令牌脱敏、设置白名单合并。
 // 状态落盘在 `$DSH_HOME/dsh-lanpost-bridge.json`，权限 0600，先写 `.tmp` 再 rename 原子替换。
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -22,6 +22,7 @@ export interface SessionMapEntry {
   updatedAt: string
 }
 
+/** 落盘的完整状态：公开设置 + 事件游标、去重窗口与会话映射。 */
 export interface BridgeState extends BridgeSettings {
   version: 1
   lastSequence: number
@@ -31,6 +32,10 @@ export interface BridgeState extends BridgeSettings {
 
 const STATE_FILE = 'dsh-lanpost-bridge.json'
 
+/** 从 JSON 载入 `sessions` 时拒绝的键：避免原型链注入（值由用户可编辑的文件提供）。 */
+const UNSAFE_SESSION_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+/** 未配置时的状态初值（新对象，调用方可以安全修改）。 */
 export const DEFAULTS: BridgeState = {
   enabled: false,
   gatewayUrl: 'wss://127.0.0.1:8443/ws/dsh',
@@ -94,6 +99,7 @@ function normalizeState(parsed: Record<string, unknown>): BridgeState {
   }
   if (isRecord(parsed.sessions)) {
     for (const [key, value] of Object.entries(parsed.sessions)) {
+      if (UNSAFE_SESSION_KEYS.has(key)) continue
       if (
         isRecord(value) &&
         typeof value.sessionId === 'string' &&
@@ -128,13 +134,23 @@ export function loadState(home?: string): BridgeState {
   return normalizeState(parsed)
 }
 
-/** 写状态：建目录 → 写 `.tmp`（0600）→ rename 原子替换，避免半截文件。 */
+/** 写状态：建目录 → 写 `.tmp`（0600）→ rename 原子替换；失败时清掉残留的 `.tmp`。 */
 export function saveState(state: BridgeState, home?: string): void {
   const file = statePath(home)
   mkdirSync(dirname(file), { recursive: true })
   const tmp = `${file}.tmp`
-  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
-  renameSync(tmp, file)
+  try {
+    writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+    renameSync(tmp, file)
+  } catch (error) {
+    // 清理是尽力而为：即使清理也失败，也要抛出最初的写入/rename 错误。
+    try {
+      rmSync(tmp, { force: true, recursive: true })
+    } catch {
+      // 原始错误更有诊断价值，清理失败不覆盖它。
+    }
+    throw error
+  }
 }
 
 /** 可回给浏览器的设置：去掉令牌原文，只暴露「是否已配置」。 */
@@ -142,6 +158,7 @@ export interface PublicSettings extends Omit<BridgeSettings, 'token'> {
   tokenSet: boolean
 }
 
+/** 可回给浏览器的设置投影：去掉令牌原文，只保留「是否已配置」。 */
 export function publicSettings(state: BridgeState): PublicSettings {
   return {
     enabled: state.enabled,
@@ -157,14 +174,14 @@ export function publicSettings(state: BridgeState): PublicSettings {
 
 /**
  * 合并设置补丁：只接受白名单键，类型不符的值忽略；`token` 为空串或非字符串表示「不改令牌」。
- * 返回新对象，不修改 `state`。
+ * `gatewayUrl` 统一 trim，空串表示清空地址。返回新对象，不修改 `state`。
  */
 export function mergeSettings(state: BridgeState, patch: Record<string, unknown>): BridgeState {
   const next: BridgeState = { ...state }
   if (!isRecord(patch)) return next
 
   if (typeof patch.enabled === 'boolean') next.enabled = patch.enabled
-  if (typeof patch.gatewayUrl === 'string') next.gatewayUrl = patch.gatewayUrl
+  if (typeof patch.gatewayUrl === 'string') next.gatewayUrl = patch.gatewayUrl.trim()
   if (typeof patch.token === 'string' && patch.token !== '') next.token = patch.token
   if (typeof patch.workspaceId === 'string' || patch.workspaceId === null) {
     next.workspaceId = patch.workspaceId

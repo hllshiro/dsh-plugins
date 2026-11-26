@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULTS, loadState, mergeSettings, publicSettings, saveState, statePath } from '../src/store.ts'
@@ -181,6 +181,37 @@ test('mergeSettings 保留非设置字段且返回新对象', () => {
   assert.equal(base.showProcess, false)
 })
 
+test('mergeSettings 对 gatewayUrl 做 trim，空串仍表示清空', () => {
+  const trimmed = mergeSettings(DEFAULTS, { gatewayUrl: '  wss://127.0.0.1:9/ws/dsh \n' })
+  assert.equal(trimmed.gatewayUrl, 'wss://127.0.0.1:9/ws/dsh')
+  assert.equal(mergeSettings(trimmed, { gatewayUrl: '' }).gatewayUrl, '')
+  assert.equal(mergeSettings(trimmed, { gatewayUrl: '   ' }).gatewayUrl, '')
+  assert.equal(trimmed.gatewayUrl, 'wss://127.0.0.1:9/ws/dsh')
+})
+
+test('loadState 跳过 sessions 里的原型链键，seenEventIds 里的同名字符串只是数据', () => {
+  const dir = home()
+  writeFileSync(
+    statePath(dir),
+    JSON.stringify({
+      ...DEFAULTS,
+      seenEventIds: ['__proto__', 'e1'],
+      sessions: JSON.parse(
+        '{"__proto__":{"sessionId":"polluted","updatedAt":"t"},"constructor":{"sessionId":"polluted2","updatedAt":"t"},"prototype":{"sessionId":"polluted3","updatedAt":"t"},"ok":{"sessionId":"s1","updatedAt":"t"}}',
+      ),
+    }),
+  )
+
+  const state = loadState(dir)
+  assert.deepEqual(state.sessions, { ok: { sessionId: 's1', updatedAt: 't' } })
+  assert.equal(Object.hasOwn(state.sessions, '__proto__'), false)
+  assert.equal(Object.hasOwn(state.sessions, 'constructor'), false)
+  assert.equal(Object.hasOwn(state.sessions, 'prototype'), false)
+  assert.equal(Object.getPrototypeOf(state.sessions), Object.prototype)
+  assert.deepEqual(state.seenEventIds, ['__proto__', 'e1'])
+  assert.equal(({} as { sessionId?: string }).sessionId, undefined)
+})
+
 test('saveState 自动创建父目录且不残留 .tmp', () => {
   const dir = home()
   const nested = join(dir, 'a', 'b')
@@ -198,6 +229,18 @@ test('saveState 覆盖已有文件（rename 原子替换）', () => {
   assert.equal(state.token, 'second')
   assert.equal(state.showProcess, true)
   assert.equal(existsSync(`${statePath(dir)}.tmp`), false)
+})
+
+test('saveState 失败时清掉 .tmp 并抛出原始错误', () => {
+  const dir = home()
+  // 目标路径被同名目录占住：rename 到目录会失败，正好覆盖「写完 tmp 但替换失败」。
+  mkdirSync(statePath(dir), { recursive: true })
+  writeFileSync(join(statePath(dir), 'blocker'), 'x')
+  const tmp = `${statePath(dir)}.tmp`
+
+  assert.throws(() => saveState(mergeSettings(DEFAULTS, { token: 'tok' }), dir))
+  assert.equal(existsSync(tmp), false)
+  assert.equal(statSync(statePath(dir)).isDirectory(), true)
 })
 
 test('saveState 完整状态可无损读回', () => {

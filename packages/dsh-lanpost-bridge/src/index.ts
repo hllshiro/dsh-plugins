@@ -22,6 +22,7 @@ import { loadState, mergeSettings, publicSettings, saveState, statePath } from '
 import type { BridgeState } from './store.ts'
 import { createTools } from './tools.ts'
 
+/** 插件行 id：仓库内唯一，统一带 `our-` 前缀。 */
 export const name = 'our-dsh-lanpost-bridge'
 
 /** 宿主服务缺一个，插件就停在 inactive；这里把装配用到的全部列清。 */
@@ -57,6 +58,10 @@ export function apply(ctx: Context): void {
   }
 
   let gateway: LanpostGateway | undefined
+  /** 入站桥延迟到网关真正启动时才建；未启用时不会订阅任何会话事件。 */
+  let bridge: InboundBridge | undefined
+  /** 装配标记：所有注册完成后才允许创建桥，避免半装配状态被晚到的回调使用。 */
+  let assemblyReady = false
   /** 网关未运行时 `status().since` 的基准；有网关时以网关自己的时间为准。 */
   let idleSince = Date.now()
 
@@ -74,20 +79,28 @@ export function apply(ctx: Context): void {
     return { message_id: result.message_id, delivery_status: result.delivery_status ?? '' }
   }
 
-  const bridge = new InboundBridge({
-    state: () => state,
-    update,
-    sessions: {
-      create: (request) => sessionControllerOf(ctx).create(request),
-      prompt: (request, signal) => sessionControllerOf(ctx).prompt(request, signal),
-      rename: (request) => sessionControllerOf(ctx).rename(request),
-    },
-    send,
-    onSessionEvent: (handler) =>
-      onSessionEvent(ctx, (session, event) => handler(session.id, event)),
-    log: (message) => log.info(message),
-    audit,
-  })
+  function bridgeInstance(): InboundBridge {
+    if (!assemblyReady) {
+      throw new Error('lanpost-bridge: 装配尚未完成，入站桥不可用')
+    }
+    if (bridge === undefined) {
+      bridge = new InboundBridge({
+        state: () => state,
+        update,
+        sessions: {
+          create: (request) => sessionControllerOf(ctx).create(request),
+          prompt: (request, signal) => sessionControllerOf(ctx).prompt(request, signal),
+          rename: (request) => sessionControllerOf(ctx).rename(request),
+        },
+        send,
+        onSessionEvent: (handler) =>
+          onSessionEvent(ctx, (session, event) => handler(session.id, event)),
+        log: (message) => log.info(message),
+        audit,
+      })
+    }
+    return bridge
+  }
 
   function stopGateway(): void {
     const current = gateway
@@ -101,19 +114,22 @@ export function apply(ctx: Context): void {
   /** 先停后启：设置变化时重建客户端，游标沿用已持久化的 `lastSequence`。 */
   function startGateway(): void {
     stopGateway()
-    if (!state.enabled || state.token === '' || state.gatewayUrl.trim() === '') {
+    // 从这一刻起处于 idle/connecting；跳过或构造失败时 status().since 都以此刻为准。
+    idleSince = Date.now()
+    const url = state.gatewayUrl.trim()
+    if (!state.enabled || state.token === '' || url === '') {
       // 未启用/未配置不是错误：保持 idle，等设置页保存或重连接口再启动。
       log.info('lanpost-bridge: gateway skipped (disabled or unconfigured)')
       return
     }
     const next = new LanpostGateway({
-      url: state.gatewayUrl,
+      url,
       token: state.token,
       lastSequence: state.lastSequence,
       events: {
         // `handleMessage` 在去重/映射/`prompt` 被接受后即返回，ACK 不等整轮结束。
-        onMessage: (message) => bridge.handleMessage(message),
-        onDelivery: (status) => bridge.handleDelivery(status),
+        onMessage: (message) => bridgeInstance().handleMessage(message),
+        onDelivery: (status) => bridgeInstance().handleDelivery(status),
         onAck: (sequence) => {
           update((current) => {
             current.lastSequence = sequence
@@ -124,7 +140,9 @@ export function apply(ctx: Context): void {
       log: (message) => log.info(`lanpost-bridge: ${message}`),
     })
     gateway = next
-    log.info(`lanpost-bridge: gateway started (${state.gatewayUrl})`)
+    // 网关配置齐备才建桥并订阅会话事件；未配置时不占用 session/event 监听。
+    bridgeInstance()
+    log.info(`lanpost-bridge: gateway started (${url})`)
     next.start()
   }
 
@@ -169,27 +187,37 @@ export function apply(ctx: Context): void {
     log: (message) => log.warn(message),
   }
 
-  ctx.effect(() => {
-    startGateway()
-    return () => {
-      stopGateway()
-      bridge.dispose()
-    }
-  })
-
+  // 先完成全部注册，再产生网关/会话订阅这类副作用：重复 apply 会在第一个重复注册处
+  // 立刻抛错，此时还没有建网关、也没有订阅，不会留下需要额外清理的残留。
   for (const tool of createTools({
     gateway: () => gateway,
     settings: () => publicSettings(state),
-    state: () => state,
+    state: () => ({ lastSequence: state.lastSequence, sessions: Object.keys(state.sessions).length }),
   })) {
     ctx.effect(() => toolsOf(ctx).register(tool))
   }
 
-  // 五条路由一次注册；DSH 对重复的 (kind, path) 会抛错，routes.ts 已保证唯一。
-  ctx.effect(() => createRoutes(routes).map((route) => webServerOf(ctx).register(route)))
+  // 每条路由一个 effect：任何一条注册中途失败，宿主也能回卷此前已注册的路由。
+  for (const route of createRoutes(routes)) {
+    ctx.effect(() => webServerOf(ctx).register(route))
+  }
 
   // `section()` 自己把注册挂在调用方 context 上，返回值就是 Cordis effect disposer。
   systemPromptOf(ctx).section({ name: 'lanpost-bridge', order: 900, text: LANPOST_PROMPT })
+
+  // 注册完成，之后才允许创建桥/启动网关；两者放在同一个 effect 里统一回卷。
+  assemblyReady = true
+  ctx.effect(() => {
+    startGateway()
+    return () => {
+      stopGateway()
+      if (bridge !== undefined) {
+        bridge.dispose()
+        bridge = undefined
+      }
+      assemblyReady = false
+    }
+  })
 
   log.info('lanpost-bridge activated')
 }

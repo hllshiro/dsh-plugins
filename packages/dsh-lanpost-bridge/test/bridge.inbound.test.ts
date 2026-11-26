@@ -417,6 +417,7 @@ test('队列超过 20 条回排队提示', async () => {
   await tick()
   assert.equal(s.sent.length, 1)
   assert.equal(s.sent[0].text, '我这边还排着 20 条消息，稍后再发。')
+  assert.equal(s.audits.filter((entry: any) => entry.detail?.action === 'queue-full').length, 1)
   release()
   await Promise.all(tasks)
   assert.equal(s.prompts.length, 20)
