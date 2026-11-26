@@ -6,7 +6,7 @@ import { dirname } from 'node:path'
 import { InboundBridge } from './bridge.ts'
 import type { ReplyTarget } from './bridge.ts'
 import { LanpostGateway } from './gateway.ts'
-import { gatewayWsUrl } from './core.ts'
+import { gatewayWsUrl, workspaceOptions } from './core.ts'
 import {
   loggerOf,
   onSessionEvent,
@@ -177,7 +177,7 @@ export function apply(ctx: Context): void {
       startGateway()
     },
     status,
-    workspaces: () => workspaceRegistryOf(ctx).list(),
+    workspaces: () => workspaceOptions(workspaceRegistryOf(ctx).list()),
     clearSession: (key) => {
       update((current) => {
         const sessions = { ...current.sessions }

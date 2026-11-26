@@ -44,6 +44,43 @@ export function gatewayWsUrl(address: string): string {
   return `ws://${address}${GATEWAY_WS_PATH}`
 }
 
+/** 设置页工作区下拉项。 */
+export interface WorkspaceOption {
+  id: string
+  title?: string
+  path: string
+}
+
+/**
+ * 归一宿主工作区条目：现在 `workspaceRegistry.list()` 返回 `{id, host, record:{path,title,…}}`，
+ * 旧/假实现可能是扁平的 `{id, title, path}`；缺 path 的条目丢弃。
+ */
+export function workspaceOption(entry: unknown): WorkspaceOption | null {
+  if (typeof entry !== 'object' || entry === null) return null
+  const item = entry as Record<string, unknown>
+  if (typeof item.id !== 'string' || item.id === '') return null
+  const record =
+    typeof item.record === 'object' && item.record !== null ? (item.record as Record<string, unknown>) : item
+  const path = record.path
+  if (typeof path !== 'string' || path === '') return null
+  const title = record.title
+  return {
+    id: item.id,
+    path,
+    ...(typeof title === 'string' && title !== '' ? { title } : {}),
+  }
+}
+
+/** 批量归一工作区列表，顺序与宿主持平。 */
+export function workspaceOptions(entries: readonly unknown[]): WorkspaceOption[] {
+  const options: WorkspaceOption[] = []
+  for (const entry of entries) {
+    const option = workspaceOption(entry)
+    if (option !== null) options.push(option)
+  }
+  return options
+}
+
 /** 消息来源类型：私聊或群聊。 */
 export type SourceKind = 'private' | 'group'
 

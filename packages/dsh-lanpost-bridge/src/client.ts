@@ -718,7 +718,7 @@ function Section(): React.ReactElement {
         setWorkspaces(workspacesResult.value)
       } else {
         setWorkspaces([])
-        setWorkspaceError('工作区列表读取失败，可直接填路径。')
+        setWorkspaceError('工作区列表读取失败，可稍后重试。')
       }
       if (statusResult.status === 'fulfilled') {
         setStatus(statusResult.value)

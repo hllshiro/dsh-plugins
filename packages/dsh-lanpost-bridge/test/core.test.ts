@@ -10,6 +10,7 @@ import {
   replyParts,
   splitUtf8,
   stripGroupTrigger,
+  workspaceOptions,
 } from '../src/core.ts'
 
 test('群前缀：命中剥掉，不命中返回 null', () => {
@@ -157,4 +158,21 @@ test('parseGatewayAddress：只接受 host:port，接受带 scheme/path 的粘�
 test('gatewayWsUrl：地址组装成明文 ws 地址', () => {
   assert.equal(gatewayWsUrl('localhost:9015'), 'ws://localhost:9015/ws/dsh')
   assert.equal(gatewayWsUrl('[::1]:9015'), 'ws://[::1]:9015/ws/dsh')
+})
+test('workspaceOptions：兼容 workspaceRegistry 的 {id, record:{path,title}} 与扁平形状', () => {
+  assert.deepEqual(
+    workspaceOptions([
+      { id: 'w1', host: {}, record: { path: 'D:/demo', title: 'demo', sessionIds: [] } },
+      { id: 'w2', title: 'plain', path: 'D:/plain' },
+      { id: 'w3', record: { title: 'no-path' } },
+      { id: '', path: 'D:/empty' },
+      null,
+      { id: 'w4', record: { path: 'C:/Users/xqkj' } },
+    ]),
+    [
+      { id: 'w1', path: 'D:/demo', title: 'demo' },
+      { id: 'w2', path: 'D:/plain', title: 'plain' },
+      { id: 'w4', path: 'C:/Users/xqkj' },
+    ],
+  )
 })

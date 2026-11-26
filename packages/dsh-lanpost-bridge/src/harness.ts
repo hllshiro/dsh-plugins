@@ -31,7 +31,12 @@ export interface SessionControllerService {
 
 /** 工作区注册服务（宿主 `ctx.workspaceRegistry`）。 */
 export interface WorkspaceRegistryService {
-  list(): Array<{ id: string; title?: string; path: string }>
+  list(): Array<{
+    id: string
+    title?: string
+    path?: string
+    record?: { title?: string; path?: string }
+  }>
 }
 
 /** 提示段注册服务（宿主 `ctx.systemPrompt`）；`section()` 返回 Cordis effect disposer。 */
