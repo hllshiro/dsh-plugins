@@ -116,7 +116,7 @@ async function ackOk(f: FakeTransport): Promise<void> {
   await settle()
 }
 
-/** 串行握手：open 只发 login，确认后才 subscribe，再 resume。 */
+/** 串行握手：open 只发 login，确认后才 resume（不再调用 subscribe）。 */
 async function handshake(
   f: FakeTransport,
   resumeResult: unknown = { latest_sequence: 0, events: [] },
@@ -124,8 +124,6 @@ async function handshake(
   f.emit('open')
   await settle()
   replyTo(f, 'rpc.login', true)
-  await settle()
-  replyTo(f, 'subscribe', true)
   await settle()
   replyTo(f, 'events.resume', resumeResult)
   await settle()
@@ -151,7 +149,7 @@ function receivedEnvelope(sequence: number): Record<string, unknown> {
   }
 }
 
-test('连接后串行握手：login 确认后才 subscribe，再 resume', async () => {
+test('连接后串行握手：login 确认后才 resume，且从不调用 subscribe', async () => {
   const f = fakeTransport()
   const gw = makeGateway(f, { lastSequence: 7 })
   gw.start()
@@ -161,16 +159,11 @@ test('连接后串行握手：login 确认后才 subscribe，再 resume', async 
 
   replyTo(f, 'rpc.login', true)
   await settle()
-  assert.deepEqual(methods(f), ['rpc.login', 'subscribe'])
-  assert.deepEqual(frames(f)[1].params, ['message.received', 'message.deliveryStatus'])
-
-  replyTo(f, 'subscribe', true)
-  await settle()
-  assert.deepEqual(methods(f), ['rpc.login', 'subscribe', 'events.resume'])
-  assert.deepEqual(frames(f)[2].params, { last_sequence: 7 })
+  assert.deepEqual(methods(f), ['rpc.login', 'events.resume'])
+  assert.deepEqual(frames(f)[1].params, { last_sequence: 7 })
 })
 
-test('login 仅接受严格 true：返回 false 报令牌错误且不订阅', async () => {
+test('login 仅接受严格 true：返回 false 报令牌错误且不继续握手', async () => {
   const f = fakeTransport()
   const gw = makeGateway(f)
   gw.start()
@@ -458,8 +451,6 @@ test('-32020 在本次握手里重置为 0 并再 resume 一次，事件被分�
   await settle()
   replyTo(f, 'rpc.login', true)
   await settle()
-  replyTo(f, 'subscribe', true)
-  await settle()
   replyErrorTo(f, 'events.resume', { code: -32020, message: 'EVENT_CURSOR_EXPIRED' })
   await settle()
 
@@ -545,8 +536,6 @@ test('ACK 失败不推进 lastAcked，重连先补发 ACK 再 resume(lastAcked)'
   await settle()
   replyTo(f, 'rpc.login', true)
   await settle()
-  replyTo(f, 'subscribe', true)
-  await settle()
 
   const ackFramesNow = ackFrames(f)
   assert.equal(ackFramesNow.length, 2)
@@ -618,8 +607,6 @@ test('ACK 在途时收到 -32020：迟到的 ACK 结果被丢弃，重置后仍�
   await settle()
   replyTo(f, 'rpc.login', true)
   await settle()
-  replyTo(f, 'subscribe', true)
-  await settle()
   assert.equal(resumeFrames(f).at(-1).params.last_sequence, 7)
 
   // 实时事件 8 处理完，ACK 8 已发出但响应未回
@@ -685,8 +672,6 @@ test('重置时在途 ACK 恰好是 lastAcked+1（sequence 1）也会被 epoch �
   await settle()
   replyTo(f, 'rpc.login', true)
   await settle()
-  replyTo(f, 'subscribe', true)
-  await settle()
   assert.equal(resumeFrames(f).at(-1).params.last_sequence, 0)
 
   // 实时事件 1：ACK 1 在途
@@ -719,7 +704,7 @@ test('重置时在途 ACK 恰好是 lastAcked+1（sequence 1）也会被 epoch �
   assert.equal(gw.status().state, 'connected')
 })
 
-// ---- 轮询模式：网关没有 subscribe 方法（-32601）时改用 events.resume 拉事件 ----
+// ---- 事件轮询：线上网关不推送，握手后按 pollIntervalMs 拉 events.resume ----
 
 /** 等到出现一个尚未应答的 events.resume 请求，返回它的 id。 */
 async function awaitResume(f: FakeTransport, seen: Set<number>): Promise<number> {
@@ -741,7 +726,7 @@ const replyToId = (f: FakeTransport, id: number, result: unknown): void => {
   f.emit('message', JSON.stringify({ jsonrpc: '2.0', id, result }))
 }
 
-test('subscribe 返回 -32601 时降级为 events.resume 轮询，事件照常分发与 ACK', async () => {
+test('握手后按 events.resume 轮询：事件照常分发与 ACK，空响应推进游标', async () => {
   const f = fakeTransport()
   const received: string[] = []
   const acked: number[] = []
@@ -757,9 +742,7 @@ test('subscribe 返回 -32601 时降级为 events.resume 轮询，事件照常�
   await settle()
   replyTo(f, 'rpc.login', true)
   await settle()
-  replyErrorTo(f, 'subscribe', { code: -32601, message: 'Method not found' })
-  await settle()
-  // 握手末尾仍有一次 resume；确认后状态才进入 connected，随后才开始轮询。
+  // 握手末尾有一次 resume；确认后状态才进入 connected，随后才开始轮询。
   replyTo(f, 'events.resume', { latest_sequence: 0, events: [] })
   await settle()
   assert.equal(gw.status().state, 'connected')
@@ -790,24 +773,6 @@ test('subscribe 返回 -32601 时降级为 events.resume 轮询，事件照常�
   assert.deepEqual(acked, [1, 2])
 })
 
-test('subscribe 成功时保持推送模式，不启动轮询', async () => {
-  const f = fakeTransport()
-  const gw = makeGateway(f, { pollIntervalMs: 5 })
-  gw.start()
-  f.emit('open')
-  await settle()
-  replyTo(f, 'rpc.login', true)
-  await settle()
-  replyTo(f, 'subscribe', true)
-  await settle()
-  replyTo(f, 'events.resume', { latest_sequence: 0, events: [] })
-  await settle()
-
-  const before = resumeFrames(f).length
-  await sleep(40)
-  assert.equal(resumeFrames(f).length, before, '推送模式下不得轮询')
-})
-
 test('stop 之后不再轮询', async () => {
   const f = fakeTransport()
   const gw = makeGateway(f, { pollIntervalMs: 5 })
@@ -815,8 +780,6 @@ test('stop 之后不再轮询', async () => {
   f.emit('open')
   await settle()
   replyTo(f, 'rpc.login', true)
-  await settle()
-  replyErrorTo(f, 'subscribe', { code: -32601, message: 'Method not found' })
   await settle()
   replyTo(f, 'events.resume', { latest_sequence: 0, events: [] })
   await settle()
@@ -839,8 +802,6 @@ test('轮询遇到 -32020 时重置游标并继续拉取', async () => {
   f.emit('open')
   await settle()
   replyTo(f, 'rpc.login', true)
-  await settle()
-  replyErrorTo(f, 'subscribe', { code: -32601, message: 'Method not found' })
   await settle()
   replyTo(f, 'events.resume', { latest_sequence: 0, events: [] })
   await settle()

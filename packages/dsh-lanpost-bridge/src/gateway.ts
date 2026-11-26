@@ -85,7 +85,7 @@ export interface GatewayOptions {
   reconnectBaseMs?: number
   /** 重连退避上限（默认 30000ms）。 */
   reconnectMaxMs?: number
-  /** 网关不支持 subscribe 时的事件轮询间隔（默认 3000ms；测试可调小）。 */
+  /** 事件轮询间隔（默认 3000ms；线上网关不推送，统一靠轮询拉取；测试可调小）。 */
   pollIntervalMs?: number
 }
 
@@ -117,7 +117,7 @@ const ACK_TIMEOUT_MS = 10_000
 const SEND_TIMEOUT_MS = 30_000
 const RECONNECT_BASE_MS = 1_000
 const RECONNECT_MAX_MS = 30_000
-/** 网关不支持 subscribe 时的事件拉取间隔。 */
+/** 事件拉取间隔：网关不推送，按固定周期 events.resume。 */
 const POLL_INTERVAL_MS = 3_000
 /** 4409 连接数超限：从第 3 档（默认 8s）起步，避免 1s 内反复撞。 */
 const RATE_LIMIT_BACKOFF_ATTEMPT = 3
@@ -242,8 +242,6 @@ export class LanpostGateway {
   private notificationChain: Promise<void> = Promise.resolve()
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectAttempt = 0
-  /** 网关是否支持订阅推送；不支持（-32601）时改用 events.resume 轮询。 */
-  private pushMode = false
   private pollTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(options: GatewayOptions) {
@@ -455,7 +453,7 @@ export class LanpostGateway {
   }
 
   /**
-   * 严格串行握手：login(必须 true) → subscribe → 重发未确认 ACK → resume(lastAcked)。
+   * 严格串行握手：login(必须 true) → 重发未确认 ACK → resume(lastAcked)。事件靠轮询续拉。
    * resume 帧发出前才捕获基线，避免握手期间到达的事件抬高基线造成误判。
    */
   private async handshake(transport: GatewayTransport): Promise<void> {
@@ -468,8 +466,7 @@ export class LanpostGateway {
         return
       }
 
-      this.pushMode = await this.trySubscribe()
-      if (transport !== this.socket) return
+      // 线上网关（协议 1.0）没有 subscribe 方法、也不主动推送：事件统一按 events.resume 轮询拉取。
       // 上次连接里没收到的 ACK 先按序补发（幂等），再以 lastAcked 续传。
       await this.queueAckFlush()
       if (transport !== this.socket) return
@@ -500,24 +497,6 @@ export class LanpostGateway {
     } catch (error) {
       if (transport !== this.socket) return
       this.onHandshakeFailure(error)
-    }
-  }
-
-  /**
-   * 尝试订阅事件推送。参考网关实现了 subscribe；线上网关可能返回 -32601（Method not found，
-   * 只有 events.resume 可用），此时降级为轮询而不是判失败。
-   */
-  private async trySubscribe(): Promise<boolean> {
-    try {
-      await this.call('subscribe', ['message.received', 'message.deliveryStatus'], RPC_TIMEOUT_MS)
-      return true
-    } catch (error) {
-      const gatewayError = toGatewayError(error, 'subscribe 失败')
-      if (gatewayError.code === -32601) {
-        this.log('网关不支持 subscribe，改用 events.resume 轮询事件')
-        return false
-      }
-      throw gatewayError
     }
   }
 
@@ -561,9 +540,9 @@ export class LanpostGateway {
     this.schedulePoll()
   }
 
-  /** 网关不支持推送时，按固定间隔拉 events.resume（未 ACK 的事件会重投）。 */
+  /** 按固定间隔拉 events.resume（未 ACK 的事件会重投；线上网关不推送）。 */
   private schedulePoll(): void {
-    if (this.pushMode || this.stopped || this.pollTimer !== null) return
+    if (this.stopped || this.pollTimer !== null) return
     if (this.state !== 'connected' || this.socket === null) return
     const timer = setTimeout(() => {
       this.pollTimer = null
@@ -580,7 +559,7 @@ export class LanpostGateway {
   }
 
   private async pollOnce(): Promise<void> {
-    if (this.stopped || this.pushMode || this.socket === null || this.state !== 'connected') return
+    if (this.stopped || this.socket === null || this.state !== 'connected') return
     try {
       const payload = parseResume(
         await this.call<unknown>('events.resume', { last_sequence: this.lastAcked }, RESUME_TIMEOUT_MS),
