@@ -20,6 +20,9 @@ function setup(overrides: any = {}) {
     enabled: true,
     seenEventIds: [],
     sessions: {},
+    turnTimeoutSeconds: overrides.turnTimeoutMs ? overrides.turnTimeoutMs / 1000 : 1800,
+    ackEnabled: overrides.ackEnabled ?? false,
+    recallAck: overrides.recallAck ?? false,
     ...overrides.state,
   }
   const prompts: any[] = []
@@ -61,7 +64,6 @@ function setup(overrides: any = {}) {
     log: (message: string) => logs.push(message),
     audit: (kind: string, detail: any) => audits.push({ kind, detail }),
     ...overrides.deps,
-    turnTimeoutMs: overrides.turnTimeoutMs ?? 10 * 60_000,
   }
   const bridge = new InboundBridge(deps)
   running.push(bridge)
@@ -389,27 +391,23 @@ test('rpcId 匹配但 sessionId 不符时不结算本轮', async () => {
   assert.equal(s.sent[0].text, '答案')
 })
 
-test('同会话连续两轮：串行投递且互不串扰', async () => {
+test('同会话连续两条：都立即投递，按各自的回合分别回复', async () => {
   const s = await begin()
   startTurn(s)
   assistant(s, [{ type: 'text', text: '第一轮' }])
 
-  // 第一轮还没结束就投第二条：必须排队，不能复用第一轮 waiter。
-  const second = s.bridge.handleMessage(msg({ eventId: 'e2', messageId: 'm2', content: { type: 'text', text: '第二条' } }))
-  let secondAcked = false
-  void second.then(() => { secondAcked = true })
-  await tick()
-  assert.equal(s.prompts.length, 1, '第一轮未结束前不得投递第二轮')
-  assert.equal(secondAcked, false, '排队中的消息不得在第一轮结束前被 ACK 接管')
-
-  endTurn(s)
-  await s.waitForReply(1)
-  await second
-  assert.equal(s.prompts.length, 2)
+  // 第一轮还没结束就投第二条：不再由插件排队，而是立刻交给宿主（排队/插话由 busyEnter 决定）。
+  await s.bridge.handleMessage(msg({ eventId: 'e2', messageId: 'm2', content: { type: 'text', text: '第二条' } }))
+  assert.equal(s.prompts.length, 2, '两条消息都应立刻投递给宿主')
   const secondRpc = s.prompts[1].requestId as string
   assert.notEqual(secondRpc, s.rpcId)
 
-  // 第一轮迟到的 assistant 不能混进第二轮的正文
+  // 第一条的消息已在第一轮里开始：先结算第一轮。
+  endTurn(s)
+  await s.waitForReply(1)
+  assert.equal(s.sent[0].text, '第一轮')
+
+  // 第二轮开始时 user/message 带第二个 rpcId；第一轮迟到的 assistant 不能混进第二轮。
   assistant(s, [{ type: 'text', text: '第一轮迟到' }])
   startTurn(s, secondRpc)
   assistant(s, [{ type: 'text', text: '第二轮' }])
@@ -561,4 +559,58 @@ test('formatTurnReply：showProcess 关闭时不附思考与统计', () => {
     }),
     '答案',
   )
+})
+
+// ── 回执、撤回与忽略前缀 ────────────────────────────────────────────────────
+
+test('开启回执：先回回执，回合结束后发最终回复并撤回回执', async () => {
+  const recalls: string[] = []
+  const s = await begin({ ackEnabled: true, recallAck: true, deps: { recall: async (id: string) => { recalls.push(id) } } })
+  assert.equal(s.sent[0].text, '已收到，正在处理…')
+  assert.equal(recalls.length, 0, '回合结束前不撤回')
+  startTurn(s)
+  assistant(s, [{ type: 'text', text: '答案' }])
+  endTurn(s)
+  await s.waitForReply(2)
+  assert.equal(s.sent[1].text, '答案')
+  await sleep(5)
+  assert.deepEqual(recalls, ['m'])
+  assert.ok(s.audits.some((entry: any) => entry.detail?.action === 'ack-sent'))
+  assert.ok(s.audits.some((entry: any) => entry.detail?.action === 'ack-recalled'))
+})
+
+test('回执文案为空时用内置默认文案', async () => {
+  const s = await begin({ ackEnabled: true, state: { ackText: '  ' } })
+  assert.equal(s.sent[0].text, '已收到，正在处理…')
+})
+
+test('关闭撤回：回执保留不撤回', async () => {
+  const recalls: string[] = []
+  const s = await begin({ ackEnabled: true, recallAck: false, deps: { recall: async (id: string) => { recalls.push(id) } } })
+  startTurn(s)
+  assistant(s, [{ type: 'text', text: '答案' }])
+  endTurn(s)
+  await s.waitForReply(2)
+  await sleep(5)
+  assert.deepEqual(recalls, [])
+})
+
+test('撤回失败只记审计，不影响最终回复', async () => {
+  const s = await begin({
+    ackEnabled: true,
+    recallAck: true,
+    deps: { recall: async () => { throw new Error('recall denied') } },
+  })
+  startTurn(s)
+  assistant(s, [{ type: 'text', text: '答案' }])
+  endTurn(s)
+  await s.waitForReply(2)
+  await sleep(5)
+  assert.equal(s.sent[1].text, '答案')
+  assert.ok(s.audits.some((entry: any) => entry.detail?.action === 'ack-recall-failed'))
+})
+
+test('promptMode 返回 steer 时按插话投递', async () => {
+  const s = await begin({ deps: { promptMode: () => 'steer' } })
+  assert.equal(s.prompts[0].mode, 'steer')
 })

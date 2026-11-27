@@ -3,7 +3,7 @@
 // 请求体与响应体都是 JSON，令牌绝不进入任何响应或审计明细。
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebRouteLike } from './harness.ts'
-import { parseGatewayAddress } from './core.ts'
+import { ACK_TEXT_MAX, IGNORE_PREFIXES_MAX, isTurnTimeoutSeconds, parseGatewayAddress } from './core.ts'
 import { publicSettings } from './store.ts'
 import type { BridgeState } from './store.ts'
 
@@ -163,6 +163,23 @@ function cleanSettingsPatch(input: Record<string, unknown>): Record<string, unkn
   }
   const showProcess = own(input, 'showProcess')
   if (typeof showProcess === 'boolean') patch.showProcess = showProcess
+  const ackEnabled = own(input, 'ackEnabled')
+  if (typeof ackEnabled === 'boolean') patch.ackEnabled = ackEnabled
+  const recallAck = own(input, 'recallAck')
+  if (typeof recallAck === 'boolean') patch.recallAck = recallAck
+  const ackText = own(input, 'ackText')
+  if (typeof ackText === 'string') patch.ackText = ackText.slice(0, ACK_TEXT_MAX)
+  const ignorePrefixes = own(input, 'ignorePrefixes')
+  if (typeof ignorePrefixes === 'string') {
+    patch.ignorePrefixes = ignorePrefixes.slice(0, IGNORE_PREFIXES_MAX)
+  }
+  const turnTimeoutSeconds = own(input, 'turnTimeoutSeconds')
+  if (turnTimeoutSeconds !== undefined) {
+    if (!isTurnTimeoutSeconds(turnTimeoutSeconds)) {
+      throw new HttpError(400, 'invalid-timeout')
+    }
+    patch.turnTimeoutSeconds = turnTimeoutSeconds
+  }
   const token = own(input, 'token')
   if (typeof token === 'string') {
     const trimmed = token.trim()

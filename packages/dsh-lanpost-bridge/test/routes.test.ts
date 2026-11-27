@@ -569,3 +569,52 @@ test('真实 HTTP 连接上 413 能送达客户端，连接之后仍可复用', 
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
 })
+
+// ── 回执、撤回、忽略前缀、单轮超时的 PATCH 校验 ─────────────────────────────
+
+test('PATCH 接受回执/撤回/忽略前缀/超时，并对超时做范围校验', async () => {
+  const h = harness()
+  const res = await call(h.routes, SETTINGS, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      ackEnabled: false,
+      ackText: '稍等，正在看',
+      recallAck: false,
+      ignorePrefixes: ' #node, ping ',
+      turnTimeoutSeconds: 3600,
+    }),
+  })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(h.patches[0], {
+    ackEnabled: false,
+    ackText: '稍等，正在看',
+    recallAck: false,
+    ignorePrefixes: ' #node, ping ',
+    turnTimeoutSeconds: 3600,
+  })
+
+  const tooSmall = await call(h.routes, SETTINGS, {
+    method: 'PATCH',
+    body: JSON.stringify({ turnTimeoutSeconds: 30 }),
+  })
+  assert.equal(tooSmall.statusCode, 400)
+  assert.deepEqual(tooSmall.body, { error: 'invalid-timeout' })
+  assert.equal(h.patches.length, 1)
+
+  const notInteger = await call(h.routes, SETTINGS, {
+    method: 'PATCH',
+    body: JSON.stringify({ turnTimeoutSeconds: '600' }),
+  })
+  assert.equal(notInteger.statusCode, 400)
+})
+
+test('PATCH 截断超长回执文案与忽略前缀', async () => {
+  const h = harness()
+  const res = await call(h.routes, SETTINGS, {
+    method: 'PATCH',
+    body: JSON.stringify({ ackText: 'a'.repeat(900), ignorePrefixes: 'b'.repeat(3000) }),
+  })
+  assert.equal(res.statusCode, 200)
+  assert.equal((h.patches[0].ackText as string).length, 500)
+  assert.equal((h.patches[0].ignorePrefixes as string).length, 2000)
+})

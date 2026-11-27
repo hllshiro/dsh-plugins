@@ -5,12 +5,54 @@
 export const TEXT_MAX_BYTES = 16 * 1024
 /** 回复单段字节上限（含 `(i/n) ` 角标）。 */
 export const REPLY_CHUNK_BYTES = 4000
-/** 每会话待处理队列上限。 */
-export const QUEUE_LIMIT = 20
-/** 等待一轮 turn/end 的超时（10 分钟）。 */
-export const TURN_TIMEOUT_MS = 10 * 60_000
 /** 入站事件去重窗口条数。 */
 export const SEEN_LIMIT = 500
+
+/** 收到消息后的默认回执；设置页可改。 */
+export const ACK_TEXT_DEFAULT = '已收到，正在处理…'
+/** 回执文本上限（字符），避免把设置项当消息面板用。 */
+export const ACK_TEXT_MAX = 500
+/** 等待一轮 turn/end 的默认超时（30 分钟）与允许范围（60 秒 – 24 小时）。 */
+export const TURN_TIMEOUT_DEFAULT_SECONDS = 30 * 60
+export const TURN_TIMEOUT_MIN_SECONDS = 60
+export const TURN_TIMEOUT_MAX_SECONDS = 24 * 60 * 60
+/** 忽略前缀列表的长度上限（字符）。 */
+export const IGNORE_PREFIXES_MAX = 2000
+
+/**
+ * 解析忽略前缀设置：按逗号（半角/全角）或换行分隔，去空白、丢空项、去重
+ * （大小写不敏感，匹配时统一小写比较）。
+ */
+export function parseIgnorePrefixes(value: string): string[] {
+  const seen = new Set<string>()
+  const prefixes: string[] = []
+  for (const raw of value.split(/[,，\n]/)) {
+    const prefix = raw.trim()
+    if (prefix === '') continue
+    const key = prefix.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    prefixes.push(prefix)
+  }
+  return prefixes
+}
+
+/** 私聊正文是否命中忽略前缀：忽略前导空白，大小写不敏感。 */
+export function isIgnoredText(text: string, prefixes: readonly string[]): boolean {
+  if (prefixes.length === 0) return false
+  const head = text.trimStart().toLowerCase()
+  return prefixes.some((prefix) => head.startsWith(prefix.toLowerCase()))
+}
+
+/** 回复超时秒数是否在允许范围内（整数、60 秒 – 24 小时）。 */
+export function isTurnTimeoutSeconds(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= TURN_TIMEOUT_MIN_SECONDS &&
+    value <= TURN_TIMEOUT_MAX_SECONDS
+  )
+}
 
 /** 群触发前缀：`/dsh` 后跟空白或字符串结束。 */
 export const GROUP_TRIGGER = /^\/dsh(?:\s+|$)/i

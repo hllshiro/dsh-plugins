@@ -11,6 +11,10 @@ import type { ToolDefinitionLike } from '../src/harness.ts'
 interface GatewayCalls {
   sendUser: Array<{ protocolId: string; text: string }>
   sendGroup: Array<{ groupId: string; text: string }>
+  sendImage: Array<{ target: unknown; name: string }>
+  recallMessage: Array<{ messageId: string }>
+  listGroups: number
+  listGroupMembers: Array<{ groupId: string; options: unknown }>
   call: Array<{ method: string; params: unknown; timeoutMs: number | undefined }>
 }
 
@@ -18,11 +22,15 @@ interface GatewayOverrides {
   status?: GatewayStatus
   sendUser?: (protocolId: string, text: string) => Promise<SendResult>
   sendGroup?: (groupId: string, text: string) => Promise<SendResult>
+  sendImage?: (target: unknown, image: { data: Buffer; mimeType: string; name: string }) => Promise<SendResult & { attachment_id: string }>
+  recallMessage?: (messageId: string) => Promise<{ message_id: string; recalled: boolean }>
+  listGroups?: () => Promise<unknown>
+  listGroupMembers?: (groupId: string, options: unknown) => Promise<unknown>
   call?: (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>
 }
 
 function makeGateway(overrides: GatewayOverrides = {}): { gateway: ToolsGateway; calls: GatewayCalls } {
-  const calls: GatewayCalls = { sendUser: [], sendGroup: [], call: [] }
+  const calls: GatewayCalls = { sendUser: [], sendGroup: [], sendImage: [], recallMessage: [], listGroups: 0, listGroupMembers: [], call: [] }
   const gateway: ToolsGateway = {
     status: () => overrides.status ?? { state: 'connected', since: 1_700_000_000_000 },
     sendUser: async (protocolId, text) => {
@@ -36,6 +44,24 @@ function makeGateway(overrides: GatewayOverrides = {}): { gateway: ToolsGateway;
       return overrides.sendGroup
         ? overrides.sendGroup(groupId, text)
         : { message_id: 'im:2', delivery_status: 'queued' }
+    },
+    sendImage: async (target, image) => {
+      calls.sendImage.push({ target, name: image.name })
+      return overrides.sendImage
+        ? overrides.sendImage(target, image)
+        : { message_id: 'im:3', delivery_status: 'queued', attachment_id: 'att-1' }
+    },
+    recallMessage: async (messageId) => {
+      calls.recallMessage.push({ messageId })
+      return overrides.recallMessage ? overrides.recallMessage(messageId) : { message_id: messageId, recalled: true }
+    },
+    listGroups: async () => {
+      calls.listGroups += 1
+      return overrides.listGroups ? overrides.listGroups() : { groups: [] }
+    },
+    listGroupMembers: async (groupId, options) => {
+      calls.listGroupMembers.push({ groupId, options })
+      return overrides.listGroupMembers ? overrides.listGroupMembers(groupId, options) : { members: [] }
     },
     call: async (method, params, timeoutMs) => {
       calls.call.push({ method, params, timeoutMs })
@@ -174,11 +200,19 @@ function usersPayload(): { users: Array<Record<string, unknown>> } {
   }
 }
 
-test('createTools 按顺序暴露三个工具，parameters/output 都是自包含 JSON Schema', () => {
+test('createTools 按顺序暴露七个工具，parameters/output 都是自包含 JSON Schema', () => {
   const tools = allTools()
   assert.deepEqual(
     tools.map((tool) => tool.name),
-    ['lanpost_send_message', 'lanpost_list_contacts', 'lanpost_bridge_status'],
+    [
+      'lanpost_send_message',
+      'lanpost_list_contacts',
+      'lanpost_list_groups',
+      'lanpost_list_group_members',
+      'lanpost_recall_message',
+      'lanpost_send_image',
+      'lanpost_bridge_status',
+    ],
   )
   for (const tool of tools) {
     assert.equal(typeof tool.description, 'string')
@@ -825,4 +859,130 @@ test('bridge_status render 用绝对时间，多次渲染结果一致', async ()
   assert.equal(first.includes('已持续'), false)
   assert.equal(first.includes('距上次变化'), false)
   assert.ok(first.includes(new Date(1_700_000_000_000).toISOString()))
+})
+
+// ── 群、成员、撤回、图片 ────────────────────────────────────────────────────
+
+test('lanpost_list_groups：投影群信息并渲染 group_id', async () => {
+  const { gateway, calls } = makeGateway({
+    listGroups: async () => ({
+      groups: [
+        {
+          group_id: 'g1',
+          group_name: '项目群',
+          master_id: 'p1',
+          master_display_name: '张三',
+          topic: '每天同步',
+          member_count: 8,
+          updated_at: '2026-11-27T01:00:00Z',
+        },
+      ],
+    }),
+  })
+  const tool = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_groups')
+  const value = (await tool.execute({}, {})) as any
+
+  assert.equal(calls.listGroups, 1)
+  assert.equal(value.ok, true)
+  assert.equal(value.groups[0].group_id, 'g1')
+  assert.equal(value.groups[0].name, '项目群')
+  assert.equal(value.groups[0].master_name, '张三')
+  assert.equal(value.groups[0].member_count, 8)
+  const text = firstText(tool, {}, value)
+  assert.match(text, /项目群/)
+  assert.match(text, /g1/)
+})
+
+test('lanpost_list_groups：网关缺方法时返回 -32601 提示', async () => {
+  const { gateway } = makeGateway({
+    listGroups: async () => {
+      throw new GatewayError(-32601, 'Method not found')
+    },
+  })
+  const tool = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_groups')
+  const value = (await tool.execute({}, {})) as any
+  assert.equal(value.ok, false)
+  assert.equal(value.code, -32601)
+  assert.match(firstText(tool, {}, value), /-32601/)
+})
+
+test('lanpost_list_group_members：透传分页并列出成员', async () => {
+  const { gateway, calls } = makeGateway({
+    listGroupMembers: async () => ({
+      group_id: 'g1',
+      group_name: '项目群',
+      total: 3,
+      members: [
+        { protocol_id: 'p1', display_name: '张三', online: true, is_master: true },
+        { protocol_id: 'p2', username: 'lisi', online: false, is_master: false },
+      ],
+    }),
+  })
+  const tool = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_list_group_members')
+  const args = { group_id: 'g1', online_only: true, page: 2, page_size: 2 }
+  const value = (await tool.execute(args, {})) as any
+
+  assert.deepEqual(calls.listGroupMembers, [{ groupId: 'g1', options: { onlineOnly: true, page: 2, pageSize: 2 } }])
+  assert.equal(value.ok, true)
+  assert.equal(value.group_id, 'g1')
+  assert.equal(value.members[1].name, 'lisi')
+  assert.equal(value.page, 2)
+  const text = firstText(tool, args, value)
+  assert.match(text, /张三/)
+  assert.match(text, /lisi/)
+})
+
+test('lanpost_list_group_members：缺少 group_id 时本地报错', async () => {
+  const tool = toolNamed(allTools({ gateway: () => makeGateway().gateway }), 'lanpost_list_group_members')
+  const value = (await tool.execute({}, {})) as any
+  assert.equal(value.ok, false)
+  assert.equal(value.code, 'invalid_args')
+})
+
+test('lanpost_recall_message：成功与形状校验', async () => {
+  const { gateway, calls } = makeGateway()
+  const tool = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_recall_message')
+  const value = (await tool.execute({ message_id: 'im:42' }, {})) as any
+
+  assert.deepEqual(calls.recallMessage, [{ messageId: 'im:42' }])
+  assert.equal(value.ok, true)
+  assert.equal(value.recalled, true)
+  assert.match(firstText(tool, { message_id: 'im:42' }, value), /im:42/)
+
+  const bad = (await tool.execute({ message_id: 'oops' }, {})) as any
+  assert.equal(bad.ok, false)
+  assert.equal(bad.code, 'invalid_args')
+})
+
+test('lanpost_send_image：读取本地文件后交给网关，返回附件 id', async () => {
+  const { writeFileSync, mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = mkdtempSync(join(tmpdir(), 'lanpost-img-'))
+  const file = join(dir, 'a.png')
+  writeFileSync(file, Buffer.from([1, 2, 3]))
+
+  const { gateway, calls } = makeGateway()
+  const tool = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_send_image')
+  const args = { target: 'user', protocol_id: 'p1', path: file }
+  const value = (await tool.execute(args, {})) as any
+
+  assert.equal(value.ok, true)
+  assert.equal(value.attachmentId, 'att-1')
+  assert.equal(calls.sendImage[0].name, 'a.png')
+  const text = firstText(tool, args, value)
+  assert.match(text, /im:3/)
+})
+
+test('lanpost_send_image：非法扩展名与不存在的文件都在本地拒绝', async () => {
+  const { gateway } = makeGateway()
+  const tool = toolNamed(allTools({ gateway: () => gateway }), 'lanpost_send_image')
+
+  const badExt = (await tool.execute({ target: 'user', protocol_id: 'p1', path: 'x.txt' }, {})) as any
+  assert.equal(badExt.ok, false)
+  assert.equal(badExt.code, 'invalid_args')
+
+  const missing = (await tool.execute({ target: 'user', protocol_id: 'p1', path: 'no-such-file.png' }, {})) as any
+  assert.equal(missing.ok, false)
+  assert.equal(missing.code, 'invalid_args')
 })

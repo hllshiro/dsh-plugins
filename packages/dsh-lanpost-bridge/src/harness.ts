@@ -21,7 +21,7 @@ export interface SessionControllerService {
     request: {
       requestId: string
       sessionId: string
-      mode: 'queue'
+      mode: 'queue' | 'steer'
       content: Array<{ type: 'text'; text: string }>
     },
     signal: AbortSignal,
@@ -113,6 +113,18 @@ export function systemPromptOf(ctx: Context): SystemPromptService {
   const service = (ctx as unknown as { get(name: string): unknown }).get('systemPrompt')
   if (!service) throw new Error('lanpost-bridge: service "systemPrompt" unavailable')
   return service as SystemPromptService
+}
+
+/** 设置服务的只读入口形状：只要 `describe()`，用来读其他插件声明的 Config。 */
+export interface SettingsService {
+  describe(): ReadonlyArray<{ ns: string; value: unknown }>
+}
+
+/** 取设置服务；宿主没提供就抛错。 */
+export function settingsOf(ctx: Context): SettingsService {
+  const service = (ctx as unknown as { get(name: string): unknown }).get('settings')
+  if (!service) throw new Error('lanpost-bridge: service "settings" unavailable')
+  return service as SettingsService
 }
 
 /** 订阅 `session/event`；返回取消订阅的 disposer。 */

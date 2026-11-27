@@ -256,14 +256,22 @@ test('publicSettings 未配置令牌时 tokenSet=false，且不含内部状态�
   const pub = publicSettings(DEFAULTS)
   assert.equal(pub.tokenSet, false)
   assert.deepEqual(Object.keys(pub).sort(), [
+    'ackEnabled',
+    'ackText',
     'enabled',
     'gatewayAddress',
+    'ignorePrefixes',
+    'recallAck',
     'selfProtocolId',
     'sessionMode',
     'showProcess',
     'tokenSet',
+    'turnTimeoutSeconds',
     'workspaceId',
   ])
+  assert.equal(pub.ackEnabled, true)
+  assert.equal(pub.recallAck, true)
+  assert.equal(pub.turnTimeoutSeconds, 1800)
   assert.equal('lastSequence' in pub, false)
   assert.equal('sessions' in pub, false)
   assert.equal('seenEventIds' in pub, false)

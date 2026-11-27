@@ -1,13 +1,15 @@
-// 入站编排：`message.received` → 去重 → 过滤（私聊全放行 / 群 `/dsh`）→ 会话映射 → 串行队列 → `prompt`
-// → 等本轮 `turn/end` → 收集最终 assistant 文本 → 切段回发。
-// 本文件不碰 DSH ctx：会话、发送、事件订阅全部经 `InboundDeps` 注入（Task 10 装配）。
+// 入站编排：`message.received` → 去重 → 过滤（私聊全放行 / 群 `/dsh`）→ 忽略前缀 → 回执
+// → 会话映射 → `prompt`（排队或插话跟随 DSH 的 busyEnter 设置）→ 等本轮 `turn/end`
+// → 收集最终 assistant 文本 → 撤回回执 → 切段回发。
+// 本文件不碰 DSH ctx：会话、发送、事件订阅全部经 `InboundDeps` 注入（装配层负责）。
 import { randomUUID } from 'node:crypto'
 import {
-  QUEUE_LIMIT,
+  ACK_TEXT_DEFAULT,
   SEEN_LIMIT,
-  TURN_TIMEOUT_MS,
   dedupeAdd,
   formatDuration,
+  isIgnoredText,
+  parseIgnorePrefixes,
   promptTextFor,
   replyParts,
   stripGroupTrigger,
@@ -17,7 +19,7 @@ import type { InboundMessage } from './gateway.ts'
 import type { SessionEventLike } from './harness.ts'
 import type { BridgeState } from './store.ts'
 
-// Task 7 从本文件消费会话事件类型；定义只有 harness.ts 一份，这里只再导出。
+// 会话事件类型定义只有 harness.ts 一份，这里为桥接使用方再导出。
 /** 会话事件类型（定义在 harness.ts，这里为桥接使用方转发）。 */
 export type { SessionEventLike }
 
@@ -25,8 +27,6 @@ export type { SessionEventLike }
 export const IMAGE_NOTICE = '暂不支持图片消息（当前仅支持文本）。'
 /** 未知 content 类型的回退文案。 */
 export const UNSUPPORTED_NOTICE = '暂不支持该类型的消息（当前仅支持文本）。'
-/** 排队超限提示；条数与 `QUEUE_LIMIT` 保持同一来源。 */
-export const QUEUE_FULL_NOTICE = `我这边还排着 ${QUEUE_LIMIT} 条消息，稍后再发。`
 
 /** 本轮没有任何 assistant 文本时的占位句。 */
 export const EMPTY_REPLY_NOTICE = '（本轮没有文本回复）'
@@ -108,7 +108,7 @@ export interface InboundDeps {
       request: {
         requestId: string
         sessionId: string
-        mode: 'queue'
+        mode: 'queue' | 'steer'
         content: Array<{ type: 'text'; text: string }>
       },
       signal: AbortSignal,
@@ -116,26 +116,21 @@ export interface InboundDeps {
     rename(request: { sessionId: string; title: string }): Promise<unknown>
   }
   send(target: ReplyTarget, text: string): Promise<{ message_id: string; delivery_status: string }>
+  /** 撤回一条已发消息（回执）；缺省视为网关不支持。 */
+  recall?(messageId: string): Promise<void>
+  /** 取 DSH 的 busyEnter 设置；缺省按 `queue`（DSH 默认值）投递。 */
+  promptMode?(): 'queue' | 'steer'
   onSessionEvent(handler: (sessionId: string, event: SessionEventLike) => void): () => void
   log(message: string): void
   now?(): number
-  /** 等一轮 `turn/end` 的上限；缺省 `TURN_TIMEOUT_MS`（10 分钟），测试注入短值。 */
-  turnTimeoutMs?: number
   /** 审计出口；宿主侧接 `writeAudit(home, kind, detail)`。缺省不写（假 deps 测试）。 */
   audit?(kind: string, detail: Record<string, unknown>): void
-}
-
-interface PromptRequest {
-  requestId: string
-  sessionId: string
-  mode: 'queue'
-  content: Array<{ type: 'text'; text: string }>
 }
 
 /** 一条入站消息经判定后的处置方式。 */
 type Plan =
   | { kind: 'drop'; reason: string }
-  | { kind: 'notice'; key: string; target: ReplyTarget; text: string; source: ReplySource }
+  | { kind: 'notice'; target: ReplyTarget; text: string; source: ReplySource }
   | {
       kind: 'prompt'
       key: string
@@ -145,29 +140,32 @@ type Plan =
     }
 
 type PromptPlan = Extract<Plan, { kind: 'prompt' }>
-type NoticePlan = Extract<Plan, { kind: 'notice' }>
 
-/** 每个会话键一条 promise 链；`pending` 含正在执行的那条。 */
-interface QueueSlot {
-  pending: number
-  tail: Promise<void>
-}
-
-/** 一轮的等待器：从 prompt 前登记，到 turn/end（或超时/停用）结算后移除。 */
+/** 一条入站消息对应的等待器：从 prompt 前登记到本轮结算（或超时/停用）。 */
 interface TurnWaiter {
   requestId: string
   sessionId: string
   target: ReplyTarget
+  /** 回执消息 id；没有回执或回执发送失败时为 null。 */
+  ackId: string | null
   /** 已看到本轮 `user/message`：本轮开始前的 assistant 事件不计入。 */
   started: boolean
   settled: boolean
   startedAt: number
+  timer?: NodeJS.Timeout
+}
+
+/**
+ * 一轮 turn 的共享素材。插话（steer）时同一条 turn 可能挂着多个等待器，
+ * 它们共用这一轮的文本与工具计数。
+ */
+interface ActiveTurn {
+  sessionId: string
+  waiters: TurnWaiter[]
   texts: string[]
   reasoning: string[]
   tools: number
-  timer?: NodeJS.Timeout
-  done: Promise<void>
-  resolve(): void
+  startedAt: number
 }
 
 function errorMessage(error: unknown): string {
@@ -227,8 +225,8 @@ function groupIdOf(event: InboundMessage): string | undefined {
 /** 宿主侧装配的入站桥；`handleMessage` 只保证不把异常抛给网关的 ACK 路径。 */
 export class InboundBridge {
   private readonly deps: InboundDeps
-  private readonly queues = new Map<string, QueueSlot>()
   private readonly waiters = new Map<string, TurnWaiter>()
+  private readonly turns = new Map<string, ActiveTurn>()
   /** 在途 prompt 的取消句柄：`dispose()` 时全部 abort，别让回合在停用后继续跑。 */
   private readonly inflight = new Set<AbortController>()
   private unsubscribe: (() => void) | undefined
@@ -243,31 +241,18 @@ export class InboundBridge {
   async handleMessage(event: InboundMessage): Promise<void> {
     if (this.disposed) return
 
-    // 先判定再记去重：被门禁丢掉的消息既不占窗口，也不触发状态写盘。
+    // 先判定再记去重：被门禁/忽略前缀丢掉的消息既不占窗口，也不触发状态写盘。
     const plan = this.plan(event)
     if (plan.kind === 'drop') {
-      this.audit({ action: 'ignored', eventId: event.eventId, reason: plan.reason })
+      this.audit({ action: 'ignored', eventId: event.eventId, messageId: event.messageId, reason: plan.reason })
       return
     }
 
     if (!this.rememberSeen(event)) return
     if (this.disposed) return
 
-    // 队列已满：不回队列里再排一条提示，直接发出并放弃这条。
-    // 判定与占位都在 enqueue 的同步段里完成，不会出现「检查后到入队前」被插队的窗口。
-    const queued = this.enqueue(plan.key, async (accepted) => {
-      if (plan.kind === 'notice') {
-        const notice: NoticePlan = plan
-        await this.reply(notice.target, notice.text)
-        return
-      }
-      const promptPlan: PromptPlan = plan
-      await this.process(promptPlan, event, accepted)
-    })
-    if (queued.kind === 'full') {
-      // 一条事件只给一个结论：满队列就只记 queue-full，不再先记 accepted。
-      this.audit({ action: 'queue-full', eventId: event.eventId, key: plan.key })
-      await this.reply(plan.target, QUEUE_FULL_NOTICE)
+    if (plan.kind === 'notice') {
+      await this.reply(plan.target, plan.text)
       return
     }
 
@@ -279,12 +264,12 @@ export class InboundBridge {
       textBytes: Buffer.byteLength(plan.text, 'utf8'),
     })
 
-    // ACK 只表示「这条事件已被接管」：等 prompt 被接受（waiter 已登记）就返回，
-    // 回复由队列在后台继续；但同会话的下一轮仍要等这一轮结算后才投递。
-    await queued.accepted
+    // 回执要「收到即回」，所以放在建会话之前；失败不阻塞主流程。
+    const ackId = await this.sendAck(plan.target)
+    await this.process(plan, event, ackId)
   }
 
-  /** 出站投递回执；v1 只把它写日志与审计，不回聊天。 */
+  /** 出站投递回执；只写日志与审计，不回聊天。 */
   handleDelivery(status: { messageId?: string; status: string; reason?: string }): void {
     const messageId = status.messageId ?? 'unknown'
     if (status.status === 'failed') {
@@ -297,8 +282,8 @@ export class InboundBridge {
   }
 
   /**
-   * 停掉队列与订阅：pending 回合静默取消（设计 §11 卸载只清理，不发消息）。
-   * 卸载/重载时网关通常已在关闭，`send` 多半失败；这里只记日志与审计。
+   * 停掉订阅与等待器：pending 回合静默取消（设计 §11 卸载只清理，不发消息）。
+   * 卸载/重载时网关通常已在关闭，`send`/`recall` 都不再调用。
    */
   dispose(): void {
     if (this.disposed) return
@@ -311,7 +296,7 @@ export class InboundBridge {
     // 在途 prompt 一并中止：等待器已取消，迟到的接受不该再让回合继续跑。
     for (const controller of this.inflight) controller.abort(new Error('lanpost-bridge: disposed'))
     this.inflight.clear()
-    this.queues.clear()
+    this.turns.clear()
   }
 
   // ── 回复收集 ────────────────────────────────────────────────────────────
@@ -329,67 +314,75 @@ export class InboundBridge {
         // 只有 rpcId 与入站投递的 requestId 对齐才算「这一轮」开始。
         waiter.started = true
         waiter.startedAt = this.now()
+        const turn = this.turnFor(sessionId)
+        if (!turn.waiters.includes(waiter)) turn.waiters.push(waiter)
         return
       }
       case 'assistant/message': {
-        const waiter = this.activeWaiter(sessionId)
-        if (!waiter) return
+        const turn = this.turns.get(sessionId)
+        if (!turn) return
         const content: unknown = event.data?.message?.content
         if (!Array.isArray(content)) return
         for (const block of content) {
           if (typeof block !== 'object' || block === null) continue
           if (typeof block.text !== 'string') continue
-          if (block.type === 'text') waiter.texts.push(block.text)
-          else if (block.type === 'reasoning') waiter.reasoning.push(block.text)
+          if (block.type === 'text') turn.texts.push(block.text)
+          else if (block.type === 'reasoning') turn.reasoning.push(block.text)
         }
         return
       }
       case 'tool/call': {
-        const waiter = this.activeWaiter(sessionId)
-        if (waiter) waiter.tools += 1
+        const turn = this.turns.get(sessionId)
+        if (turn) turn.tools += 1
         return
       }
       case 'turn/end': {
         const kind: unknown = event.data?.reason?.kind
         if (typeof kind !== 'string' || kind === '') return
-        const waiter = this.activeWaiter(sessionId)
-        if (!waiter) return
-        this.settle(waiter, kind)
+        const turn = this.turns.get(sessionId)
+        if (!turn) return
+        this.settleTurn(turn, kind)
         return
       }
     }
   }
 
-  /** 已开始、未结算且属于该会话的等待器（串行队列保证一个会话至多一条）。 */
-  private activeWaiter(sessionId: string): TurnWaiter | undefined {
-    for (const waiter of this.waiters.values()) {
-      if (!waiter.settled && waiter.started && waiter.sessionId === sessionId) return waiter
+  /** 取或建该会话的当前一轮；一轮只会在 turn/end 或最后一个等待器结算时移除。 */
+  private turnFor(sessionId: string): ActiveTurn {
+    const existing = this.turns.get(sessionId)
+    if (existing) return existing
+    const turn: ActiveTurn = {
+      sessionId,
+      waiters: [],
+      texts: [],
+      reasoning: [],
+      tools: 0,
+      startedAt: this.now(),
     }
-    return undefined
+    this.turns.set(sessionId, turn)
+    return turn
   }
 
   /** 在 `prompt` 之前登记等待器：事件可能比 prompt 的 promise 更早到。 */
-  private expectTurn(requestId: string, sessionId: string, target: ReplyTarget): TurnWaiter {
-    let resolve: () => void = () => {}
-    const done = new Promise<void>((settle) => {
-      resolve = settle
-    })
+  private expectTurn(
+    requestId: string,
+    sessionId: string,
+    target: ReplyTarget,
+    ackId: string | null,
+  ): TurnWaiter {
     const waiter: TurnWaiter = {
       requestId,
       sessionId,
       target,
+      ackId,
       started: false,
       settled: false,
       startedAt: this.now(),
-      texts: [],
-      reasoning: [],
-      tools: 0,
-      done,
-      resolve,
     }
 
     // 用可清理的定时器而不是 AbortSignal.timeout：unref 不吊住进程，结算时清掉。
-    const timer = setTimeout(() => this.settle(waiter, 'timeout'), this.deps.turnTimeoutMs ?? TURN_TIMEOUT_MS)
+    const timeoutMs = this.deps.state().turnTimeoutSeconds * 1000
+    const timer = setTimeout(() => this.settleWaiter(waiter, 'timeout'), timeoutMs)
     timer.unref()
     waiter.timer = timer
 
@@ -403,92 +396,178 @@ export class InboundBridge {
     waiter.settled = true
     if (waiter.timer) clearTimeout(waiter.timer)
     this.waiters.delete(waiter.requestId)
-    waiter.resolve()
+    this.detach(waiter)
   }
 
-  /** 停用时静默取消：不回发任何消息，只记审计并让队列继续收尾。 */
+  /** 把等待器从所属一轮里摘掉；一轮空了就从表里清除。 */
+  private detach(waiter: TurnWaiter): void {
+    const turn = this.turns.get(waiter.sessionId)
+    if (!turn) return
+    turn.waiters = turn.waiters.filter((item) => item !== waiter)
+    if (turn.waiters.length === 0) this.turns.delete(waiter.sessionId)
+  }
+
+  /** 停用时静默取消：不回发任何消息，只记审计。 */
   private cancelWaiter(waiter: TurnWaiter): void {
     if (waiter.settled) return
     waiter.settled = true
     if (waiter.timer) clearTimeout(waiter.timer)
     this.waiters.delete(waiter.requestId)
+    this.detach(waiter)
     this.audit({ action: 'turn-canceled', sessionId: waiter.sessionId })
-    waiter.resolve()
   }
 
-  /** 结算一轮：先摘掉等待器再回发，保证重复 `turn/end` / 超时不会回第二次。 */
-  private settle(waiter: TurnWaiter, reason: string): void {
+  /** 结算整轮：按目标去重回发一次，再逐个撤回回执并清理等待器。 */
+  private settleTurn(turn: ActiveTurn, reason: string): void {
+    this.turns.delete(turn.sessionId)
+    const waiters = turn.waiters
+    turn.waiters = []
+    if (reason === 'timeout') {
+      this.audit({ action: 'turn-timeout', sessionId: turn.sessionId })
+    }
+    const text = formatTurnReply({
+      texts: turn.texts,
+      reasoning: turn.reasoning,
+      tools: turn.tools,
+      elapsedMs: this.now() - turn.startedAt,
+      showProcess: this.deps.state().showProcess,
+      reason,
+    })
+
+    const settled = waiters.filter((waiter) => !waiter.settled)
+    for (const waiter of settled) {
+      waiter.settled = true
+      if (waiter.timer) clearTimeout(waiter.timer)
+      this.waiters.delete(waiter.requestId)
+    }
+    void this.deliverToTargets(settled, text, reason)
+  }
+
+  /** 单个等待器超时：只结算它自己，本轮其它（插话）等待器继续等。 */
+  private settleWaiter(waiter: TurnWaiter, reason: string): void {
     if (waiter.settled) return
     waiter.settled = true
     if (waiter.timer) clearTimeout(waiter.timer)
     this.waiters.delete(waiter.requestId)
-    if (reason === 'timeout') {
-      this.audit({ action: 'turn-timeout', sessionId: waiter.sessionId })
-    }
 
-    void this.deliverReply(waiter, reason)
-      .catch((error: unknown) => {
-        // 回发链路整体失败也不能静默：进日志与审计，等待器照常结束。
-        this.deps.log(`lanpost-bridge: reply failed: ${errorMessage(error)}`)
-        this.audit({ action: 'reply-send-failed', reason, error: errorMessage(error) })
-      })
-      .finally(() => waiter.resolve())
-  }
+    const turn = this.turns.get(waiter.sessionId)
+    this.detach(waiter)
+    this.audit({ action: 'turn-timeout', sessionId: waiter.sessionId })
 
-  /**
-   * 逐段回发。发送是调用即返回（网关投递回执另走 `handleDelivery`），
-   * 某段抛错后不再尝试后续段：宁可少发，也不要半截消息后面又接上。
-   * `delivery_status === 'failed'` 表示网关已受理但投递失败：记失败审计，后续段照发。
-   */
-  private async deliverReply(waiter: TurnWaiter, reason: string): Promise<void> {
     const text = formatTurnReply({
-      texts: waiter.texts,
-      reasoning: waiter.reasoning,
-      tools: waiter.tools,
+      texts: turn ? turn.texts : [],
+      reasoning: turn ? turn.reasoning : [],
+      tools: turn ? turn.tools : 0,
       elapsedMs: this.now() - waiter.startedAt,
       showProcess: this.deps.state().showProcess,
       reason,
     })
+    void this.deliverToTargets([waiter], text, reason)
+  }
+
+  /**
+   * 按目标去重后逐段回发，然后撤回各条回执。发送失败只记审计，不重试。
+   * `delivery_status === 'failed'` 表示网关已受理但投递失败：记失败审计，后续段照发。
+   */
+  private async deliverToTargets(
+    waiters: readonly TurnWaiter[],
+    text: string,
+    reason: string,
+  ): Promise<void> {
+    const targets = new Map<string, ReplyTarget>()
+    for (const waiter of waiters) {
+      targets.set(targetKey(waiter.target), waiter.target)
+    }
+
     const parts = replyParts(text)
     let failures = 0
+    for (const [key, target] of targets) {
+      for (let index = 0; index < parts.length; index += 1) {
+        let deliveryStatus = ''
+        try {
+          const result = await this.deps.send(target, parts[index])
+          if (typeof result?.delivery_status === 'string') deliveryStatus = result.delivery_status
+        } catch (error) {
+          this.deps.log(
+            `lanpost-bridge: reply segment ${index + 1}/${parts.length} to ${key} failed: ${errorMessage(error)}`,
+          )
+          this.audit({
+            action: 'reply-send-failed',
+            reason,
+            target: key,
+            segment: index + 1,
+            total: parts.length,
+            error: errorMessage(error),
+          })
+          break
+        }
 
-    for (let index = 0; index < parts.length; index += 1) {
-      let deliveryStatus = ''
-      try {
-        const result = await this.deps.send(waiter.target, parts[index])
-        if (typeof result?.delivery_status === 'string') deliveryStatus = result.delivery_status
-      } catch (error) {
-        this.deps.log(
-          `lanpost-bridge: reply segment ${index + 1}/${parts.length} failed: ${errorMessage(error)}`,
-        )
-        this.audit({
-          action: 'reply-send-failed',
-          reason,
-          segment: index + 1,
-          total: parts.length,
-          error: errorMessage(error),
-        })
-        return
-      }
-
-      if (deliveryStatus === 'failed') {
-        failures += 1
-        this.deps.log(`lanpost-bridge: reply segment ${index + 1}/${parts.length} delivery failed`)
-        this.audit({
-          action: 'reply-send-failed',
-          reason,
-          segment: index + 1,
-          total: parts.length,
-          status: deliveryStatus,
-        })
+        if (deliveryStatus === 'failed') {
+          failures += 1
+          this.deps.log(`lanpost-bridge: reply segment ${index + 1}/${parts.length} delivery failed`)
+          this.audit({
+            action: 'reply-send-failed',
+            reason,
+            target: key,
+            segment: index + 1,
+            total: parts.length,
+            status: deliveryStatus,
+          })
+        }
       }
     }
 
-    if (failures === 0) this.audit({ action: 'reply-sent', reason, segments: parts.length })
+    for (const waiter of waiters) await this.recallAck(waiter.ackId)
+    if (failures === 0) {
+      this.audit({
+        action: 'reply-sent',
+        reason,
+        segments: parts.length,
+        targets: targets.size,
+      })
+    }
   }
 
   private now(): number {
     return this.deps.now ? this.deps.now() : Date.now()
+  }
+
+  // ── 回执 ────────────────────────────────────────────────────────────────
+
+  /** 发一条回执；未启用或发送失败返回 null（失败不阻塞主流程）。 */
+  private async sendAck(target: ReplyTarget): Promise<string | null> {
+    const state = this.deps.state()
+    if (!state.ackEnabled) return null
+    const text = state.ackText.trim() === '' ? ACK_TEXT_DEFAULT : state.ackText
+    try {
+      const result = await this.deps.send(target, text)
+      const messageId = typeof result?.message_id === 'string' ? result.message_id : ''
+      if (messageId === '') {
+        this.audit({ action: 'ack-sent', messageId: null })
+        return null
+      }
+      this.audit({ action: 'ack-sent', messageId })
+      return messageId
+    } catch (error) {
+      this.deps.log(`lanpost-bridge: ack to ${targetKey(target)} failed: ${errorMessage(error)}`)
+      this.audit({ action: 'ack-failed', target: targetKey(target), error: errorMessage(error) })
+      return null
+    }
+  }
+
+  /** 撤回一条回执；未开启撤回、网关不支持或失败都只记日志/审计。 */
+  private async recallAck(messageId: string | null): Promise<void> {
+    if (messageId === null || messageId === '') return
+    if (!this.deps.state().recallAck) return
+    const recall = this.deps.recall
+    if (!recall) return
+    try {
+      await recall(messageId)
+      this.audit({ action: 'ack-recalled', messageId })
+    } catch (error) {
+      this.deps.log(`lanpost-bridge: recall ${messageId} failed: ${errorMessage(error)}`)
+      this.audit({ action: 'ack-recall-failed', messageId, error: errorMessage(error) })
+    }
   }
 
   // ── 判定 ────────────────────────────────────────────────────────────────
@@ -522,7 +601,8 @@ export class InboundBridge {
   }
 
   private plan(event: InboundMessage): Plan {
-    const self = this.deps.state().selfProtocolId
+    const state = this.deps.state()
+    const self = state.selfProtocolId
     const senderId = event.sender.protocolId
     // 空发送方无法建会话也无法回发，还会拼出 `direct:` 这样的空键。
     if (senderId === '') return { kind: 'drop', reason: 'missing-sender' }
@@ -565,87 +645,58 @@ export class InboundBridge {
 
     if (text === null) {
       const notice = content.type === 'image' ? IMAGE_NOTICE : UNSUPPORTED_NOTICE
-      return { kind: 'notice', key, target, text: notice, source }
+      return { kind: 'notice', target, text: notice, source }
     }
     if (isBlank(text)) return { kind: 'drop', reason: 'empty-text' }
+    // 忽略前缀只作用于私聊：给这个节点单独发数据时用，不进会话、不回执。
+    if (isIgnoredText(text, parseIgnorePrefixes(state.ignorePrefixes))) {
+      return { kind: 'drop', reason: 'ignore-prefix' }
+    }
     return { kind: 'prompt', key, target, text, source }
-  }
-
-  // ── 串行队列 ────────────────────────────────────────────────────────────
-
-  /**
-   * 把任务排进会话键的串行链，返回「调用方可以放行 ACK」的 promise。
-   * 满额判定与 `pending` 自增在同一个同步段内完成，并发调用不会插到两者之间；
-   * 满额时返回 `full`，调用方负责回排队提示且不占用队列。
-   * `accepted` 由任务自己在该轮 prompt 被接受后调用；任务本身继续跑完整轮
-   * （含回复发送），链尾才会前进，从而保住同会话串行。
-   */
-  private enqueue(
-    key: string,
-    task: (accepted: () => void) => Promise<void>,
-  ): { kind: 'full' } | { kind: 'queued'; accepted: Promise<void> } {
-    let slot = this.queues.get(key)
-    if (!slot) {
-      slot = { pending: 0, tail: Promise.resolve() }
-      this.queues.set(key, slot)
-    }
-    const current = slot
-    if (current.pending >= QUEUE_LIMIT) return { kind: 'full' }
-    current.pending += 1
-
-    let markAccepted: () => void = () => {}
-    const accepted = new Promise<void>((resolve) => {
-      markAccepted = resolve
-    })
-
-    const run = async (): Promise<void> => {
-      try {
-        if (this.disposed) return
-        await task(markAccepted)
-      } catch (error) {
-        // 队列必须继续跑：错误写日志与审计，不把整条链堵死。
-        this.deps.log(`lanpost-bridge: inbound task for ${key} failed: ${errorMessage(error)}`)
-        this.audit({ action: 'queue-failed', key, error: errorMessage(error) })
-      } finally {
-        // 任何异常都不能让调用方永远等 ACK。
-        markAccepted()
-        current.pending -= 1
-        if (current.pending === 0 && this.queues.get(key) === current) this.queues.delete(key)
-      }
-    }
-
-    const chain = current.tail.then(run, run)
-    current.tail = chain
-    return { kind: 'queued', accepted }
   }
 
   // ── 处理 ────────────────────────────────────────────────────────────────
 
+  /**
+   * 投递一条消息：等 `prompt` 被接受（或失败提示发完）就返回，让网关及时 ACK。
+   * 回复本身在后台等 turn/end，不阻塞事件处理。
+   */
   private async process(
     plan: PromptPlan,
     event: InboundMessage,
+    ackId: string | null,
+  ): Promise<void> {
+    const requestId = `lanpost-${randomUUID()}`
+    const text = promptTextFor(plan.source, plan.text)
+    let markAccepted: () => void = () => {}
+    const accepted = new Promise<void>((resolve) => {
+      markAccepted = resolve
+    })
+    void this.runPrompt(plan, event, requestId, text, ackId, markAccepted)
+    await accepted
+  }
+
+  /** 建会话 → 登记等待器 → prompt；失败时回提示并撤回回执。 */
+  private async runPrompt(
+    plan: PromptPlan,
+    event: InboundMessage,
+    requestId: string,
+    text: string,
+    ackId: string | null,
     accepted: () => void,
   ): Promise<void> {
     let phase: 'session' | 'prompt' = 'session'
     try {
-      const session = await this.ensureSession(plan.key, plan.source, event)
-      if (this.disposed) {
-        accepted()
-        return
-      }
-      phase = 'prompt'
-      await this.deliver(plan, session.sessionId, event, accepted)
+      await this.startTurn(plan, event, requestId, text, ackId)
     } catch (error) {
       // 停用期间被中止的 prompt 不是业务失败，不回任何消息（dispose 静默取消）。
-      if (this.disposed) {
-        accepted()
-        return
-      }
-      const text =
+      if (this.disposed) return
+      phase = errorCode(error) === undefined ? 'session' : 'prompt'
+      const notice =
         phase === 'session'
           ? `创建会话失败：${errorMessage(error)}`
           : `会话忙或不可用：${errorMessage(error)}`
-      this.deps.log(`lanpost-bridge: ${text}`)
+      this.deps.log(`lanpost-bridge: ${notice}`)
       this.audit({
         action: 'failed',
         eventId: event.eventId,
@@ -653,9 +704,67 @@ export class InboundBridge {
         phase,
         error: errorMessage(error),
       })
-      await this.reply(plan.target, text)
-      // 失败提示发完再放行 ACK，保持失败路径原有的「await 后可见」语义。
+      await this.reply(plan.target, notice)
+      await this.recallAck(ackId)
+    } finally {
       accepted()
+    }
+  }
+
+  /** 建会话并投递；会话在 GUI 里被删（`session/not-found`）时重建一次再试。 */
+  private async startTurn(
+    plan: PromptPlan,
+    event: InboundMessage,
+    requestId: string,
+    text: string,
+    ackId: string | null,
+  ): Promise<void> {
+    let session = await this.ensureSession(plan.key, plan.source, event)
+    let waiter = this.expectTurn(requestId, session.sessionId, plan.target, ackId)
+    try {
+      await this.promptOnce(requestId, session.sessionId, text)
+      return
+    } catch (error) {
+      this.abandon(waiter)
+      if (errorCode(error) !== 'session/not-found') throw error
+      this.deps.log(`lanpost-bridge: session ${session.sessionId} for ${plan.key} is gone, recreating`)
+      this.audit({ action: 'session-recreate', eventId: event.eventId, key: plan.key, sessionId: session.sessionId })
+      this.forget(plan.key)
+    }
+
+    // 会话被删：重建一次再投一遍，不把错误甩给用户。
+    session = await this.ensureSession(plan.key, plan.source, event)
+    waiter = this.expectTurn(requestId, session.sessionId, plan.target, ackId)
+    try {
+      await this.promptOnce(requestId, session.sessionId, text)
+    } catch (error) {
+      this.abandon(waiter)
+      throw error
+    }
+  }
+
+  /** 单次投递；30 秒未接受视为失败（由上层回提示）。 */
+  private async promptOnce(requestId: string, sessionId: string, text: string): Promise<void> {
+    const mode = this.deps.promptMode?.() ?? 'queue'
+    const request = {
+      requestId,
+      sessionId,
+      mode,
+      content: [{ type: 'text' as const, text }],
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(
+      () => controller.abort(new Error('lanpost-bridge: prompt timed out')),
+      PROMPT_TIMEOUT_MS,
+    )
+    timer.unref()
+    this.inflight.add(controller)
+    try {
+      await this.deps.sessions.prompt(request, controller.signal)
+    } finally {
+      clearTimeout(timer)
+      this.inflight.delete(controller)
     }
   }
 
@@ -678,59 +787,6 @@ export class InboundBridge {
     this.audit({ action: 'session-created', eventId: event.eventId, key, sessionId: created.sessionId })
     await this.retitle(created.sessionId, source)
     return { sessionId: created.sessionId }
-  }
-
-  private async deliver(
-    plan: PromptPlan,
-    sessionId: string,
-    event: InboundMessage,
-    accepted: () => void,
-  ): Promise<void> {
-    try {
-      await this.prompt(plan, sessionId, accepted)
-      return
-    } catch (error) {
-      if (errorCode(error) !== 'session/not-found') throw error
-      this.deps.log(`lanpost-bridge: session ${sessionId} for ${plan.key} is gone, recreating`)
-      this.audit({ action: 'session-recreate', eventId: event.eventId, key: plan.key, sessionId })
-      this.forget(plan.key)
-    }
-
-    // 会话在 GUI 里被删了：重建一次再投一遍，不把错误甩给用户。
-    const recreated = await this.ensureSession(plan.key, plan.source, event)
-    await this.prompt(plan, recreated.sessionId, accepted)
-  }
-
-  private async prompt(plan: PromptPlan, sessionId: string, accepted: () => void): Promise<void> {
-    const request: PromptRequest = {
-      requestId: `lanpost-${randomUUID()}`,
-      sessionId,
-      mode: 'queue',
-      content: [{ type: 'text', text: promptTextFor(plan.source, plan.text) }],
-    }
-
-    // 先登记再投递：会话事件可能早于 prompt 的 promise 返回。
-    const waiter = this.expectTurn(request.requestId, sessionId, plan.target)
-
-    // 用可清理的定时器而不是 AbortSignal.timeout：unref 不吊住进程，done 时清掉。
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(new Error('lanpost-bridge: prompt timed out')), PROMPT_TIMEOUT_MS)
-    timer.unref()
-    this.inflight.add(controller)
-    try {
-      await this.deps.sessions.prompt(request, controller.signal)
-    } catch (error) {
-      // prompt 没被接受：这一轮不会发生，撤掉等待器后再交给上层决定文案/重试。
-      this.abandon(waiter)
-      throw error
-    } finally {
-      clearTimeout(timer)
-      this.inflight.delete(controller)
-    }
-
-    // prompt 已被接受、waiter 已登记：此时才放行 ACK；随后继续等本轮结算。
-    accepted()
-    await waiter.done
   }
 
   private async retitle(sessionId: string, source: ReplySource): Promise<void> {
@@ -767,20 +823,22 @@ export class InboundBridge {
     })
   }
 
-  /**
-   * 回一条提示。发送本身是尽力而为：网关断线时没有第二条通道，
-   * 失败只进日志与审计（设计文档的失败矩阵），不把队列打断。
-   */
+  /** 回一条提示。发送失败只进日志与审计（设计文档的失败矩阵）。 */
   private async reply(target: ReplyTarget, text: string): Promise<void> {
     try {
       await this.deps.send(target, text)
     } catch (error) {
-      this.deps.log(`lanpost-bridge: reply to ${target.kind} failed: ${errorMessage(error)}`)
-      this.audit({ action: 'send-failed', target: target.kind, error: errorMessage(error) })
+      this.deps.log(`lanpost-bridge: reply to ${targetKey(target)} failed: ${errorMessage(error)}`)
+      this.audit({ action: 'send-failed', target: targetKey(target), error: errorMessage(error) })
     }
   }
 
   private audit(detail: Record<string, unknown>): void {
     this.deps.audit?.('inbound', detail)
   }
+}
+
+/** 目标去重键：同一轮回发只向同一目标发一次。 */
+function targetKey(target: ReplyTarget): string {
+  return target.kind === 'user' ? `user:${target.protocolId}` : `group:${target.groupId}`
 }

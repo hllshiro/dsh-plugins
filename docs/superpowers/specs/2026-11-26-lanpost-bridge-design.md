@@ -265,3 +265,32 @@ packages/lanpost-bridge/
 - **问题**：原 `lanpost_find_contact` 与远端语义不一致——远端 `users.list` 是联系人**名册**（`keyword` 可选、`page`、`page_size` ≤200、返回 `total`），而工具要求 `keyword` 必填、固定 `page=1`/`page_size=20`、`truncated` 靠猜测，导致列不出全量、超过 20 条无法继续，名字也误导模型把它当搜索器。
 - **决定**：方案 B（用户 m02089）——工具改名 `lanpost_list_contacts`，`keyword` 可选（省略/空串=不过滤），新增 `page`（1 基）与 `page_size`（默认 50、上限 200）；输出带 `total`/`page`/`page_size`；`truncated` 优先用 `page*page_size < total`，缺 `total` 时本页取满即提示「可能还有更多」。`lanpost_send_message` 描述与系统提示段同步改引用。
 - **验证**：包测试 225/225；`pnpm run check`、`pnpm run build` 通过；注入校验 `✓ our-dsh-lanpost-bridge`；宿主 schema 校验器对新输出 8/8 通过（过程中抓到输出字段 `pageSize` 与 schema `page_size` 不一致，已修复）；dev profile `dsh web` 启动无激活告警，`GET /api/lanpost-bridge/settings` 正常。模型层实际调用未做（测试会话没有可用网关，且 headless profile 未安装）。
+## 16. 第二轮迭代：回执、内置排队、忽略前缀、可配超时与网关新接口（2026-11-27）
+
+### 16.1 需求与决定
+
+| 需求 | 决定 |
+| --- | --- |
+| 收到消息立即回执，思考完成后撤回 | 入站消息通过过滤与去重后立刻发一条回执（`ackEnabled`，文案 `ackText`，留空用内置「已收到，正在处理…」）；`turn/end` 结算后、最终回复发出前调 `message.recall` 撤回回执（`recallAck`）。撤回失败只记审计，不影响最终回复。每条入站消息各自一条回执，私聊与群都发。 |
+| 多条消息用 DSH 内置排队/插话 | 删除插件自建串行队列（含 20 条上限提示）。每条消息只做「去重写盘 → 映射写盘 → prompt 接受 → 等待器登记」就返回（ACK 不再被整轮阻塞），回复在后台进行。投递 `mode` 实时读 DSH `ui-conversation` 设置的 `busyEnter`（`queue` / `steer`）。插话时同轮多条消息共用一个 `ActiveTurn`，回复按目标去重后发给该轮所有来源。 |
+| 指定前缀的私聊直接丢弃 | 新增 `ignorePrefixes`（逗号分隔、大小写不敏感、整条消息前缀匹配、仅私聊）。命中后静默丢弃：不回执、不建会话、不写映射，只记 `ignored` 审计；事件照常 ACK。 |
+| 内置超时太短 | 新增 `turnTimeoutSeconds`（默认 1800，范围 60–86400），从设置读取，不再固定 10 分钟。 |
+| 对接网关新接口 | 新增 4 个工具：`lanpost_list_groups`、`lanpost_list_group_members`、`lanpost_recall_message`、`lanpost_send_image`；入站图片改为下载（`GET /media/<id>`，校验 sha256 与 10 MiB 上限）后交给模型；网关缺方法（`-32601`）时工具回「当前网关版本没有该接口」。 |
+
+### 16.2 落地形态
+
+- `src/core.ts`：新增回执文案/超时/忽略前缀常量与 `parseIgnorePrefixes`、`isIgnoredText`、`isTurnTimeoutSeconds`；删除 `QUEUE_LIMIT`、`TURN_TIMEOUT_MS`。
+- `src/store.ts`：`BridgeSettings` 增加 5 个字段，`normalizeState`/`mergeSettings`/`publicSettings` 同步。
+- `src/bridge.ts`：队列 → `ActiveTurn` 多等待器；`sendAck`/`recallAck`/`settleTurn`/`deliverToTargets`；`promptMode()` 与 `recall()` 由装配层注入。
+- `src/gateway.ts`：`listGroups`、`listGroupMembers`、`recallMessage`、`sendImage`（prepareUpload → POST /media → image 消息）、`downloadMedia`。
+- `src/tools.ts`：7 个工具；新增工具的输出 schema 只用宿主子集（`type/oneOf/properties/…`，禁用 `anyOf`）。
+- `src/routes.ts`：PATCH 白名单新增 5 个键，超时非法回 400 `invalid-timeout`，回执文案/忽略前缀按上限截断。
+- `src/client.ts`：设置页新增回执区、忽略前缀与单轮超时输入；`formsEqual`/`toForm`/`toPatch` 同步。
+- `src/index.ts`：`inject` 增加 `settings`；`promptMode()` 读 `ctx.settings.describe()` 的 `ui-conversation.busyEnter`；桥接注入 `recall` 与 `promptMode`；系统提示改为介绍 7 个工具。
+
+### 16.3 验证结论（2026-11-27）
+
+- 包内测试 247 条全绿（`node --test --experimental-test-isolation=none "test/*.test.ts"`；本机 `node --test` 默认隔离会 `spawn EPERM`）。
+- `pnpm run check`、`pnpm run build` 通过。
+- 网关实测（192.168.2.8:9015，2026-11-27）：`groups.list`、`message.recall`、`subscribe` 仍回 `-32601`；`media.prepareUpload` 可用，HTTP `POST/GET /media` 未上线。因此新工具在该网关下会返回 `-32601` 提示，等对端升级后再做真机联调。
+- 测试基础设施修复：`test/client.test.ts` 连续换 fetch 桩后会把桩还原回来，导致同进程内后续用例拿到假 `Response`；改为每个用例结束一律还原到模块加载时的原生 `fetch`。

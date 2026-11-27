@@ -11,6 +11,7 @@ import {
   loggerOf,
   onSessionEvent,
   sessionControllerOf,
+  settingsOf,
   systemPromptOf,
   toolsOf,
   webServerOf,
@@ -33,13 +34,14 @@ export const inject = [
   'sessionController',
   'workspaceRegistry',
   'systemPrompt',
+  'settings',
 ]
 
 /**
  * 模型可见的提示段：只讲「什么时候用哪个工具」。
  * 静态常量，不拼运行时状态，避免每轮提示词变化导致 KV Cache 失效。
  */
-const LANPOST_PROMPT = `当用户要求通过 lanpost（局域网 IM）发消息、找联系人或查看桥接状态时，先调用 lanpost_list_contacts 拿到对方的 protocol_id（可省略 keyword 列出全部，或用分页取更多），再用 lanpost_send_message 发送；要确认桥接是否启用、网关连接状态或会话映射时调用 lanpost_bridge_status。消息会原样投递到对端聊天，发送前确认正文完整。工具返回 ok=false 时，把 error 告知用户并按 code 排查，不要重复重试。`
+const LANPOST_PROMPT = `当用户要求通过 lanpost（局域网 IM）发消息、找联系人或查看桥接状态时：联系人用 lanpost_list_contacts，群用 lanpost_list_groups / lanpost_list_group_members 拿 group_id 与成员 protocol_id；文本用 lanpost_send_message，本机图片用 lanpost_send_image；需要撤回刚发的消息用 lanpost_recall_message；桥接状态用 lanpost_bridge_status。消息会原样投递到对端聊天，发送前确认正文完整。工具返回 ok=false 时，把 error 告知用户并按 code 排查，不要重复重试。`
 
 /**
  * 装配插件。所有注册都经 `ctx.effect()` 记账，卸载时按 LIFO 回卷；
@@ -80,6 +82,20 @@ export function apply(ctx: Context): void {
     return { message_id: result.message_id, delivery_status: result.delivery_status ?? '' }
   }
 
+  /**
+   * 入站消息用哪种投递方式：跟随 DSH 会话的 `busyEnter` 设置（queue=排队，steer=插话）。
+   * 设置服务读不到该命名空间时按宿主默认值 `queue` 处理。
+   */
+  const promptMode = (): 'queue' | 'steer' => {
+    const descriptor = settingsOf(ctx)
+      .describe()
+      .find((row) => row.ns === 'ui-conversation')
+    const value = descriptor?.value
+    return typeof value === 'object' && value !== null && (value as { busyEnter?: unknown }).busyEnter === 'steer'
+      ? 'steer'
+      : 'queue'
+  }
+
   function bridgeInstance(): InboundBridge {
     if (!assemblyReady) {
       throw new Error('lanpost-bridge: 装配尚未完成，入站桥不可用')
@@ -94,6 +110,12 @@ export function apply(ctx: Context): void {
           rename: (request) => sessionControllerOf(ctx).rename(request),
         },
         send,
+        recall: async (messageId) => {
+          const current = gateway
+          if (!current) throw new Error('lanpost 网关未连接')
+          await current.recallMessage(messageId)
+        },
+        promptMode,
         onSessionEvent: (handler) =>
           onSessionEvent(ctx, (session, event) => handler(session.id, event)),
         log: (message) => log.info(message),

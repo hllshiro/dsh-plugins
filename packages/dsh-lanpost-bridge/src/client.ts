@@ -22,6 +22,11 @@ export interface PublicSettings {
   sessionMode: SessionMode
   showProcess: boolean
   selfProtocolId: string | null
+  ackEnabled: boolean
+  ackText: string
+  recallAck: boolean
+  ignorePrefixes: string
+  turnTimeoutSeconds: number
 }
 
 /** 工作区下拉的一项。 */
@@ -121,6 +126,14 @@ export function normalizeSettings(raw: unknown): PublicSettings {
     showProcess: source.showProcess === true,
     selfProtocolId:
       typeof source.selfProtocolId === 'string' && source.selfProtocolId !== '' ? source.selfProtocolId : null,
+    ackEnabled: source.ackEnabled !== false,
+    ackText: typeof source.ackText === 'string' ? source.ackText : '',
+    recallAck: source.recallAck !== false,
+    ignorePrefixes: typeof source.ignorePrefixes === 'string' ? source.ignorePrefixes : '',
+    turnTimeoutSeconds:
+      typeof source.turnTimeoutSeconds === 'number' && Number.isInteger(source.turnTimeoutSeconds)
+        ? source.turnTimeoutSeconds
+        : 1800,
   }
 }
 
@@ -262,6 +275,11 @@ export interface SettingsForm {
   sessionMode: SessionMode
   showProcess: boolean
   selfProtocolId: string
+  ackEnabled: boolean
+  ackText: string
+  recallAck: boolean
+  ignorePrefixes: string
+  turnTimeoutSeconds: string
 }
 
 /** 提交给宿主 PATCH 的补丁；空令牌时省略 token 键。 */
@@ -272,6 +290,11 @@ export interface SettingsPatch {
   sessionMode: SessionMode
   showProcess: boolean
   selfProtocolId: string | null
+  ackEnabled: boolean
+  ackText: string
+  recallAck: boolean
+  ignorePrefixes: string
+  turnTimeoutSeconds: number
   token?: string
 }
 
@@ -290,6 +313,11 @@ export function toForm(settings: PublicSettings): SettingsForm {
     sessionMode: settings.sessionMode,
     showProcess: settings.showProcess,
     selfProtocolId: settings.selfProtocolId ?? '',
+    ackEnabled: settings.ackEnabled,
+    ackText: settings.ackText,
+    recallAck: settings.recallAck,
+    ignorePrefixes: settings.ignorePrefixes,
+    turnTimeoutSeconds: String(settings.turnTimeoutSeconds),
   }
 }
 
@@ -302,6 +330,11 @@ export function toPatch(form: SettingsForm): SettingsPatch {
     sessionMode: form.sessionMode,
     showProcess: form.showProcess,
     selfProtocolId: blankToNull(form.selfProtocolId),
+    ackEnabled: form.ackEnabled,
+    ackText: form.ackText,
+    recallAck: form.recallAck,
+    ignorePrefixes: form.ignorePrefixes,
+    turnTimeoutSeconds: Number(form.turnTimeoutSeconds.trim()),
   }
   const token = form.token.trim()
   if (token !== '') patch.token = token
@@ -676,7 +709,12 @@ function formsEqual(a: SettingsForm, b: SettingsForm): boolean {
     a.workspaceId === b.workspaceId &&
     a.sessionMode === b.sessionMode &&
     a.showProcess === b.showProcess &&
-    a.selfProtocolId === b.selfProtocolId
+    a.selfProtocolId === b.selfProtocolId &&
+    a.ackEnabled === b.ackEnabled &&
+    a.ackText === b.ackText &&
+    a.recallAck === b.recallAck &&
+    a.ignorePrefixes === b.ignorePrefixes &&
+    a.turnTimeoutSeconds === b.turnTimeoutSeconds
   )
 }
 
@@ -1000,6 +1038,77 @@ function Section(): React.ReactElement {
                 update({ showProcess: event.target.checked }),
             }),
             h('span', { style: styles.label }, '回复中附上思考与工具摘要'),
+          ),
+          h('span', { style: styles.label }, '收到消息时的回执'),
+          h(
+            'label',
+            { style: styles.checkRow },
+            h('input', {
+              type: 'checkbox',
+              checked: form.ackEnabled,
+              onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+                update({ ackEnabled: event.target.checked }),
+            }),
+            h('span', { style: styles.label }, '先回一条确认，再开始处理'),
+          ),
+          h(
+            Field,
+            {
+              label: '回执文案',
+              hint: '留空使用内置文案「已收到，正在处理…」；仅在开启回执时发送。',
+            },
+            h('input', {
+              type: 'text',
+              value: form.ackText,
+              placeholder: '留空使用内置文案',
+              spellCheck: false,
+              onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+                update({ ackText: event.target.value }),
+              style: styles.input,
+            }),
+          ),
+          h(
+            'label',
+            { style: styles.checkRow },
+            h('input', {
+              type: 'checkbox',
+              checked: form.recallAck,
+              onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+                update({ recallAck: event.target.checked }),
+            }),
+            h('span', { style: styles.label }, '最终回复发出后撤回这条回执'),
+          ),
+          h(
+            Field,
+            {
+              label: '忽略前缀（仅私聊）',
+              hint: '逗号分隔；命中的私聊消息直接丢弃，不回复、不进会话。',
+            },
+            h('input', {
+              type: 'text',
+              value: form.ignorePrefixes,
+              placeholder: '例如 #node, ping',
+              spellCheck: false,
+              onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+                update({ ignorePrefixes: event.target.value }),
+              style: styles.input,
+            }),
+          ),
+          h(
+            Field,
+            {
+              label: '单轮超时（秒）',
+              hint: '60–86400；超时后回复「这一轮超时」并停止等待，默认 1800。',
+            },
+            h('input', {
+              type: 'number',
+              min: 60,
+              max: 86400,
+              value: form.turnTimeoutSeconds,
+              onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+                update({ turnTimeoutSeconds: event.target.value }),
+              style: styles.input,
+            }),
           ),
           h(
             Field,

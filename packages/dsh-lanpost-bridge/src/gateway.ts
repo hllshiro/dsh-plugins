@@ -4,7 +4,7 @@
  * 本模块只负责「与网关之间的网络层」，不碰 DSH ctx、不碰 store 持久化：
  * 收发经 GatewayEvents 交给上层；ACK 的持久化通过 onAck 回调由上层落盘。
  */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
 import { SEEN_LIMIT, TEXT_MAX_BYTES, dedupeAdd } from './core.ts'
 
@@ -28,10 +28,17 @@ export interface InboundSender {
   displayName: string
 }
 
-/** 入站内容：v1 只处理文本，图片类型保留给上层明确拒绝。 */
+/** 入站内容：文本直接处理，图片带附件信息供上层下载。 */
 export type InboundContent =
   | { type: 'text'; text: string }
-  | { type: 'image'; mimeType: string; name: string }
+  | {
+      type: 'image'
+      mimeType: string
+      name: string
+      attachmentId: string
+      size: number
+      sha256: string
+    }
 
 /** 网关推送的入站消息（字段已归一化，可直接用于去重与会话映射）。 */
 export interface InboundMessage {
@@ -115,6 +122,10 @@ const RPC_TIMEOUT_MS = 10_000
 const RESUME_TIMEOUT_MS = 15_000
 const ACK_TIMEOUT_MS = 10_000
 const SEND_TIMEOUT_MS = 30_000
+const RECALL_TIMEOUT_MS = 15_000
+/** 媒体上传/下载的超时与大小上限（与网关文档一致：≤10MiB）。 */
+const MEDIA_TIMEOUT_MS = 60_000
+const MEDIA_MAX_BYTES = 10 * 1024 * 1024
 const RECONNECT_BASE_MS = 1_000
 const RECONNECT_MAX_MS = 30_000
 /** 事件拉取间隔：网关不推送，按固定周期 events.resume。 */
@@ -351,6 +362,143 @@ export class LanpostGateway {
       SEND_TIMEOUT_MS,
     )
     return parseSendResult(result)
+  }
+
+  /** 群列表；网关未实现时由调用方把 `-32601` 翻成「版本不支持」。 */
+  async listGroups(): Promise<unknown> {
+    return this.call<unknown>('groups.list', {}, RPC_TIMEOUT_MS)
+  }
+
+  /** 群成员列表；分页与在线过滤参数与 `users.list` 同形。 */
+  async listGroupMembers(
+    groupId: string,
+    options: { onlineOnly: boolean; page: number; pageSize: number },
+  ): Promise<unknown> {
+    const params: Record<string, unknown> = {
+      group_id: groupId,
+      page: options.page,
+      page_size: options.pageSize,
+    }
+    if (options.onlineOnly) params.online_only = true
+    return this.call<unknown>('groups.members', params, RPC_TIMEOUT_MS)
+  }
+
+  /** 撤回一条已发消息。 */
+  async recallMessage(messageId: string): Promise<{ message_id: string; recalled: boolean }> {
+    const result = await this.call<unknown>(
+      'message.recall',
+      { message_id: messageId },
+      RECALL_TIMEOUT_MS,
+    )
+    const record = asRecord(result)
+    return {
+      message_id: asString(record.message_id) || messageId,
+      recalled: record.recalled === false ? false : true,
+    }
+  }
+
+  /**
+   * 发一条图片消息：`media.prepareUpload` 换 transfer_id → `POST /media` 拿 attachment_id
+   * → 以 image content 调 `message.sendUser/sendGroup`。正文不写临时文件。
+   */
+  async sendImage(
+    target: { kind: 'user'; protocolId: string } | { kind: 'group'; groupId: string },
+    image: { data: Buffer; mimeType: string; name: string },
+  ): Promise<SendResult & { attachment_id: string }> {
+    if (image.data.length > MEDIA_MAX_BYTES) {
+      throw new GatewayError(
+        LOCAL_ERROR_CODE,
+        `图片超过 10 MiB 上限（${image.data.length} 字节），未发送`,
+      )
+    }
+    const sha256 = createHash('sha256').update(image.data).digest('hex')
+    const prepared = await this.call<unknown>(
+      'media.prepareUpload',
+      { mime_type: image.mimeType, name: image.name, size: image.data.length, sha256 },
+      15_000,
+    )
+    const transferId = asString(asRecord(prepared).transfer_id)
+    if (transferId === '') {
+      throw new GatewayError(-32603, 'media.prepareUpload 返回缺少 transfer_id')
+    }
+
+    const attachmentId = await this.uploadMedia(transferId, image, sha256)
+    const content = {
+      type: 'image',
+      attachment_id: attachmentId,
+      mime_type: image.mimeType,
+      name: image.name,
+      size: image.data.length,
+      sha256,
+    }
+    const method = target.kind === 'user' ? 'message.sendUser' : 'message.sendGroup'
+    const idField = target.kind === 'user' ? 'protocol_id' : 'group_id'
+    const id = target.kind === 'user' ? target.protocolId : target.groupId
+    const result = await this.call<unknown>(
+      method,
+      { request_id: randomUUID(), [idField]: id, content },
+      SEND_TIMEOUT_MS,
+    )
+    return { ...parseSendResult(result), attachment_id: attachmentId }
+  }
+
+  /** 下载一个附件；带 `expectedSha256` 时校验内容，不一致抛错。 */
+  async downloadMedia(
+    attachmentId: string,
+    expectedSha256?: string,
+  ): Promise<{ data: Buffer; mimeType: string }> {
+    const response = await fetch(`${this.httpBase()}/media/${encodeURIComponent(attachmentId)}`, {
+      headers: { Authorization: `Bearer ${this.token}` },
+      signal: AbortSignal.timeout(MEDIA_TIMEOUT_MS),
+    })
+    if (!response.ok) {
+      throw new GatewayError(LOCAL_ERROR_CODE, `媒体下载失败：HTTP ${response.status}`)
+    }
+    const data = Buffer.from(await response.arrayBuffer())
+    if (data.length > MEDIA_MAX_BYTES) {
+      throw new GatewayError(LOCAL_ERROR_CODE, `媒体超过 10 MiB 上限（${data.length} 字节）`)
+    }
+    if (expectedSha256 !== undefined && expectedSha256 !== '') {
+      const actual = createHash('sha256').update(data).digest('hex')
+      if (actual !== expectedSha256.toLowerCase()) {
+        throw new GatewayError(LOCAL_ERROR_CODE, '媒体校验失败：sha256 不一致')
+      }
+    }
+    return { data, mimeType: response.headers.get('content-type') ?? '' }
+  }
+
+  /** 上传到 `POST /media`，返回 attachment_id。 */
+  private async uploadMedia(
+    transferId: string,
+    image: { data: Buffer; mimeType: string; name: string },
+    sha256: string,
+  ): Promise<string> {
+    const response = await fetch(`${this.httpBase()}/media`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        'x-transfer-id': transferId,
+        'x-sha256': sha256,
+        'x-name': encodeURIComponent(image.name),
+        'content-type': image.mimeType,
+      },
+      body: new Uint8Array(image.data),
+      signal: AbortSignal.timeout(MEDIA_TIMEOUT_MS),
+    })
+    if (!response.ok) {
+      throw new GatewayError(LOCAL_ERROR_CODE, `媒体上传失败：HTTP ${response.status}`)
+    }
+    const body: unknown = await response.json()
+    const attachmentId = asString(asRecord(body).attachment_id)
+    if (attachmentId === '') {
+      throw new GatewayError(-32603, '媒体上传返回缺少 attachment_id')
+    }
+    return attachmentId
+  }
+
+  /** 由 WebSocket URL 推出 HTTP 基址（同一 host:port，明文）。 */
+  private httpBase(): string {
+    return `http://${new URL(this.url).host}`
   }
 
   /**
@@ -714,7 +862,14 @@ export class LanpostGateway {
       },
       content:
         asString(content.type) === 'image'
-          ? { type: 'image', mimeType: asString(content.mime_type), name: asString(content.name) }
+          ? {
+              type: 'image',
+              mimeType: asString(content.mime_type),
+              name: asString(content.name),
+              attachmentId: asString(content.attachment_id),
+              size: typeof content.size === 'number' ? content.size : 0,
+              sha256: asString(content.sha256),
+            }
           : { type: 'text', text: asString(content.text) },
       timestamp: asString(data.timestamp),
     }

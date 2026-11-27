@@ -264,7 +264,7 @@ test('message.received 的图片内容转为 image 形态', async () => {
       conversation_type: 'group',
       group_id: '998877',
       sender: { protocol_id: 'p2', username: 'lisi' },
-      content: { type: 'image', mime_type: 'image/png', name: '截图.png', attachment_id: 'att_1' },
+      content: { type: 'image', mime_type: 'image/png', name: '截图.png', attachment_id: 'att_1', size: 2048, sha256: 'abc123' },
       timestamp: '2026-11-26T02:00:01Z',
     },
   })
@@ -272,7 +272,14 @@ test('message.received 的图片内容转为 image 形态', async () => {
   assert.equal(got.length, 1)
   assert.equal(got[0].conversationType, 'group')
   assert.equal(got[0].groupId, '998877')
-  assert.deepEqual(got[0].content, { type: 'image', mimeType: 'image/png', name: '截图.png' })
+  assert.deepEqual(got[0].content, {
+    type: 'image',
+    mimeType: 'image/png',
+    name: '截图.png',
+    attachmentId: 'att_1',
+    size: 2048,
+    sha256: 'abc123',
+  })
 })
 
 test('message.deliveryStatus 通知交给 events.onDelivery', async () => {
@@ -816,4 +823,127 @@ test('轮询遇到 -32020 时重置游标并继续拉取', async () => {
   replyToId(f, second, { latest_sequence: 0, events: [] })
   await settle()
   assert.equal(gw.status().state, 'connected')
+})
+
+// ── 新增网关接口：groups / members / recall / media ─────────────────────────
+
+test('listGroups / listGroupMembers / recallMessage 的方法名与参数形状', async () => {
+  const f = fakeTransport()
+  const gw = makeGateway(f)
+  gw.start()
+  await handshake(f)
+
+  const groups = gw.listGroups()
+  await settle()
+  const groupsReq = requestFrame(f, 'groups.list')
+  assert.deepEqual(groupsReq.params, {})
+  f.emit('message', JSON.stringify({ jsonrpc: '2.0', id: groupsReq.id, result: { groups: [{ group_id: 'g1' }] } }))
+  assert.deepEqual(await groups, { groups: [{ group_id: 'g1' }] })
+
+  const members = gw.listGroupMembers('g1', { onlineOnly: true, page: 2, pageSize: 50 })
+  await settle()
+  const membersReq = requestFrame(f, 'groups.members')
+  assert.deepEqual(membersReq.params, { group_id: 'g1', online_only: true, page: 2, page_size: 50 })
+  f.emit('message', JSON.stringify({ jsonrpc: '2.0', id: membersReq.id, result: { members: [] } }))
+  assert.deepEqual(await members, { members: [] })
+
+  const offline = gw.listGroupMembers('g1', { onlineOnly: false, page: 1, pageSize: 20 })
+  await settle()
+  assert.equal('online_only' in requestFrame(f, 'groups.members').params, false)
+  f.emit('message', JSON.stringify({ jsonrpc: '2.0', id: requestFrame(f, 'groups.members').id, result: { members: [] } }))
+  await offline
+
+  const recall = gw.recallMessage('im:42')
+  await settle()
+  const recallReq = requestFrame(f, 'message.recall')
+  assert.deepEqual(recallReq.params, { message_id: 'im:42' })
+  f.emit('message', JSON.stringify({ jsonrpc: '2.0', id: recallReq.id, result: { message_id: 'im:42', recalled: true } }))
+  assert.deepEqual(await recall, { message_id: 'im:42', recalled: true })
+})
+
+test('sendImage：prepareUpload → POST /media → image 消息', async () => {
+  const f = fakeTransport()
+  const gw = makeGateway(f, { url: 'ws://192.168.2.8:9015/ws/dsh' } as any)
+  gw.start()
+  const fetchCalls: Array<{ url: string; init: RequestInit | undefined }> = []
+  const fetcher = globalThis.fetch
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    fetchCalls.push({ url: String(input), init })
+    if (String(input).endsWith('/media')) {
+      return new Response(JSON.stringify({ attachment_id: 'att-9' }), { status: 200 })
+    }
+    return new Response(new Uint8Array([1, 2, 3]), {
+      status: 200,
+      headers: { 'content-type': 'image/png', 'x-sha256': 'sha' },
+    })
+  }) as typeof fetch
+  try {
+    await handshake(f)
+    const data = Buffer.from([1, 2, 3])
+    const pending = gw.sendImage({ kind: 'user', protocolId: 'p1' }, { data, mimeType: 'image/png', name: '截图.png' })
+    await settle()
+    const prepReq = requestFrame(f, 'media.prepareUpload')
+    assert.equal(prepReq.params.size, 3)
+    assert.equal(prepReq.params.mime_type, 'image/png')
+    const sha = prepReq.params.sha256 as string
+    f.emit('message', JSON.stringify({ jsonrpc: '2.0', id: prepReq.id, result: { transfer_id: 'tr-1' } }))
+    await settle()
+    const upload = fetchCalls.find((call) => call.url.endsWith('/media'))
+    assert.ok(upload)
+    const headers = upload.init?.headers as Record<string, string>
+    assert.equal(headers['x-transfer-id'], 'tr-1')
+    assert.equal(headers['x-sha256'], sha)
+    assert.equal(headers['x-name'], encodeURIComponent('截图.png'))
+    const sendReq = requestFrame(f, 'message.sendUser')
+    assert.deepEqual(sendReq.params.content, {
+      type: 'image',
+      attachment_id: 'att-9',
+      mime_type: 'image/png',
+      name: '截图.png',
+      size: 3,
+      sha256: sha,
+    })
+    f.emit('message', JSON.stringify({ jsonrpc: '2.0', id: sendReq.id, result: { message_id: 'im:9', delivery_status: 'queued' } }))
+    const result = await pending
+    assert.equal(result.message_id, 'im:9')
+    assert.equal((result as any).attachment_id, 'att-9')
+  } finally {
+    globalThis.fetch = originalFetch
+    void fetcher
+  }
+})
+
+test('sendImage：超过 10 MiB 在本地拒绝，不发帧', async () => {
+  const f = fakeTransport()
+  const gw = makeGateway(f)
+  gw.start()
+  await handshake(f)
+  await assert.rejects(
+    gw.sendImage({ kind: 'user', protocolId: 'p1' }, { data: Buffer.alloc(10 * 1024 * 1024 + 1), mimeType: 'image/png', name: 'a.png' }),
+    (error: unknown) => error instanceof GatewayError && /10 MiB/.test((error as Error).message),
+  )
+  assert.equal(frames(f).filter((frame) => frame.method === 'media.prepareUpload').length, 0)
+})
+
+test('downloadMedia：GET /media/<id> 带 Bearer，sha256 不符时报错', async () => {
+  const f = fakeTransport()
+  const gw = makeGateway(f, { url: 'ws://192.168.2.8:9015/ws/dsh' } as any)
+  const calls: Array<{ url: string; init: RequestInit | undefined }> = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(input), init })
+    return new Response(new Uint8Array([9, 9]), { status: 200, headers: { 'content-type': 'image/png' } })
+  }) as typeof fetch
+  try {
+    const ok = await gw.downloadMedia('att-1')
+    assert.equal(calls[0].url, 'http://x/media/att-1')
+    assert.equal((calls[0].init?.headers as Record<string, string>).Authorization, 'Bearer tok')
+    assert.deepEqual([...ok.data], [9, 9])
+    assert.equal(ok.mimeType, 'image/png')
+
+    await assert.rejects(gw.downloadMedia('att-1', 'deadbeef'), /sha256/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })

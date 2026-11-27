@@ -13,7 +13,15 @@ import type { BridgeState } from '../src/store.ts'
 import type { ToolDefinitionLike, WebRouteLike } from '../src/harness.ts'
 import { RECONNECT, SESSIONS, SETTINGS, STATUS, WORKSPACES } from '../src/routes.ts'
 
-const TOOL_NAMES = ['lanpost_bridge_status', 'lanpost_list_contacts', 'lanpost_send_message']
+const TOOL_NAMES = [
+  'lanpost_bridge_status',
+  'lanpost_list_contacts',
+  'lanpost_list_group_members',
+  'lanpost_list_groups',
+  'lanpost_recall_message',
+  'lanpost_send_image',
+  'lanpost_send_message',
+]
 
 /** 一条已注册的提示段（只取断言需要的字段）。 */
 interface RegisteredSection {
@@ -147,6 +155,9 @@ function createFakeCtx(options: { failRouteAt?: number } = {}): FakeCtx {
     workspaceRegistry: {
       list: () => [{ id: 'w1', title: 'demo', path: 'D:/demo' }],
     },
+    settings: {
+      describe: () => [{ ns: 'ui-conversation', value: { busyEnter: 'queue' } }],
+    },
     systemPrompt: {
       section(section: RegisteredSection) {
         if (sections.some((item) => item.name === section.name)) {
@@ -263,10 +274,11 @@ test('导出名与注入服务与仓库约定一致', () => {
     'sessionController',
     'workspaceRegistry',
     'systemPrompt',
+    'settings',
   ])
 })
 
-test('装配：3 个工具、5 条路由、1 段提示；未配置时不启网关', () => {
+test('装配：7 个工具、5 条路由、1 段提示；未配置时不启网关', () => {
   const { handle } = withTempHome()
   try {
     const fake = createFakeCtx()
@@ -329,8 +341,8 @@ test('卸载回卷：工具、路由、会话订阅与提示段全部清空', ()
   try {
     const fake = createFakeCtx()
     apply(fake.ctx)
-    // 3 工具 + 5 路由（逐条 effect）+ 网关 effect + 1 个提示段注册。
-    assert.equal(fake.disposers.length, 10)
+    // 7 工具 + 5 路由（逐条 effect）+ 网关 effect + 1 个提示段注册。
+    assert.equal(fake.disposers.length, 14)
     assert.equal(fake.sessionListeners, 0)
 
     fake.disposeAll()
@@ -466,7 +478,7 @@ test('重复 apply 在首个注册处抛错，不产生网关/会话订阅残留
 
     assert.throws(() => apply(fake.ctx), /duplicate tool/)
 
-    assert.equal(fake.tools.size, 3)
+    assert.equal(fake.tools.size, 7)
     assert.equal(fake.routes.length, 5)
     assert.equal(fake.sections.length, 1)
     assert.equal(fake.disposers.length, disposers)

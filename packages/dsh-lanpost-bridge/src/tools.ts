@@ -7,6 +7,7 @@
 // （这是给模型的正常结果，不是崩溃）；其他异常照旧抛出，不吞错、不重试。
 // 状态工具只做脱敏投影，绝不返回令牌原文。
 
+import { readFileSync } from 'node:fs'
 import { TEXT_MAX_BYTES } from './core.ts'
 import { GatewayError } from './gateway.ts'
 import type { GatewayStatus, SendResult } from './gateway.ts'
@@ -18,6 +19,16 @@ export interface ToolsGateway {
   status(): GatewayStatus
   sendUser(protocolId: string, text: string): Promise<SendResult>
   sendGroup(groupId: string, text: string): Promise<SendResult>
+  sendImage(
+    target: { kind: 'user'; protocolId: string } | { kind: 'group'; groupId: string },
+    image: { data: Buffer; mimeType: string; name: string },
+  ): Promise<SendResult & { attachment_id: string }>
+  recallMessage(messageId: string): Promise<{ message_id: string; recalled: boolean }>
+  listGroups(): Promise<unknown>
+  listGroupMembers(
+    groupId: string,
+    options: { onlineOnly: boolean; page: number; pageSize: number },
+  ): Promise<unknown>
   call(method: string, params?: unknown, timeoutMs?: number): Promise<unknown>
 }
 
@@ -163,6 +174,9 @@ function failureHint(code: number | string): string {
   }
   if (code === BAD_RESPONSE) {
     return '\n网关返回的数据不符合预期，请重试或查看 lanpost_bridge_status。'
+  }
+  if (code === -32601) {
+    return '\n当前网关版本没有该接口（-32601），请升级 lanpost-im 客户端后重试。'
   }
   return '\n这是网关返回的失败，请检查目标 id 与网关状态后重试。'
 }
@@ -665,15 +679,549 @@ function renderStatus(_args: unknown, value: unknown): Array<{ type: 'text'; tex
 }
 
 // ---------------------------------------------------------------------------
+// lanpost_list_groups
+
+const GROUPS_PARAMETERS: Record<string, unknown> = {
+  type: 'object',
+  properties: {},
+  required: [],
+  additionalProperties: false,
+}
+
+const GROUP_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    group_id: { type: 'string', description: '发群消息时使用的 group_id' },
+    name: { type: 'string' },
+    master_id: { type: 'string', description: '群主的 protocol_id（网关未给出时为空串）' },
+    master_name: { type: 'string' },
+    topic: { type: 'string' },
+    announcement: { type: 'string' },
+    member_count: {
+      oneOf: [{ type: 'integer' }, { type: 'null' }],
+      description: '成员数；网关未给出时为 null',
+    },
+    updated_at: {
+      oneOf: [{ type: 'string' }, { type: 'null' }],
+      description: '群资料更新时间；网关未给出时为 null',
+    },
+  },
+  required: [
+    'group_id',
+    'name',
+    'master_id',
+    'master_name',
+    'topic',
+    'announcement',
+    'member_count',
+    'updated_at',
+  ],
+  additionalProperties: false,
+}
+
+const GROUPS_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean' },
+    groups: { type: 'array', items: GROUP_SCHEMA, description: '当前账号所在的群' },
+    total: {
+      oneOf: [{ type: 'integer' }, { type: 'null' }],
+      description: '网关给出的群总数；未返回时为 null',
+    },
+    error: { type: 'string' },
+    code: {
+      oneOf: [{ type: 'number' }, { type: 'string' }],
+      description: '失败代码：数字为网关错误码，字符串为本地或网关响应检查出的代码',
+    },
+  },
+  required: ['ok'],
+  additionalProperties: false,
+}
+
+function projectGroup(value: unknown): Record<string, unknown> {
+  const record = isRecord(value) ? value : {}
+  return {
+    group_id: asString(record.group_id),
+    name: asString(record.name) || asString(record.group_name),
+    master_id: asString(record.master_id),
+    master_name: asString(record.master_name) || asString(record.master_display_name),
+    topic: asString(record.topic),
+    announcement: asString(record.announcement),
+    member_count: typeof record.member_count === 'number' ? record.member_count : null,
+    updated_at: asString(record.updated_at) || null,
+  }
+}
+
+async function executeGroups(deps: ToolsDeps, args: unknown): Promise<unknown> {
+  if (!isRecord(args)) return failure('参数必须是空对象；lanpost_list_groups 不接受参数')
+  const extra = unknownKey(args, [])
+  if (extra !== undefined) return failure(`未知参数：${extra}；lanpost_list_groups 不接受参数`)
+
+  const gateway = deps.gateway()
+  if (gateway === undefined) return notConnected()
+  try {
+    const raw = await gateway.listGroups()
+    if (!isRecord(raw) || !Array.isArray(raw.groups)) {
+      return failure('groups.list 返回格式异常：缺少 groups 数组', BAD_RESPONSE)
+    }
+    return {
+      ok: true,
+      groups: raw.groups.map(projectGroup),
+      total: typeof raw.total === 'number' ? raw.total : null,
+    }
+  } catch (error) {
+    if (error instanceof GatewayError) return gatewayFailure(error)
+    throw error
+  }
+}
+
+function renderGroups(_args: unknown, value: unknown): Array<{ type: 'text'; text: string }> {
+  if (isRecord(value) && value.ok === false) {
+    const failed = value as unknown as ToolFailure
+    return [
+      {
+        type: 'text',
+        text: `列出群失败：${oneLine(failed.error)}\n${codeLabel(failed.code)}${failureHint(failed.code)}`,
+      },
+    ]
+  }
+  const listed = value as { groups: Array<Record<string, unknown>>; total: number | null }
+  if (listed.groups.length === 0) return [{ type: 'text', text: '当前账号没有加入任何群。' }]
+  const lines = listed.groups.map((group) => {
+    const name = oneLine(asString(group.name)) || '（未命名群）'
+    const members =
+      typeof group.member_count === 'number' ? ` · ${group.member_count} 人` : ''
+    const topic = asString(group.topic) === '' ? '' : ` · ${oneLine(group.topic)}`
+    return `- ${name} · group_id: ${oneLine(asString(group.group_id))}${members}${topic}`
+  })
+  const header =
+    listed.total === null
+      ? `群列表：${listed.groups.length} 个`
+      : `群列表：${listed.groups.length} 个（共 ${listed.total} 个）`
+  return [{ type: 'text', text: `${header}\n${lines.join('\n')}` }]
+}
+
+// ---------------------------------------------------------------------------
+// lanpost_list_group_members
+
+const MEMBERS_KEYS = ['group_id', 'online_only', 'page', 'page_size'] as const
+
+const MEMBERS_PARAMETERS: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    group_id: { type: 'string', description: '群的 group_id（可先用 lanpost_list_groups 查）' },
+    online_only: { type: 'boolean', description: 'true 时只返回在线成员' },
+    page: { type: 'integer', description: '页码，从 1 开始；默认 1' },
+    page_size: {
+      type: 'integer',
+      description: '每页条数，1–200；默认 50',
+    },
+  },
+  required: ['group_id'],
+  additionalProperties: false,
+}
+
+const MEMBER_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    protocol_id: { type: 'string' },
+    name: { type: 'string', description: '显示名；网关只给 username 时即 username' },
+    online: { type: 'boolean' },
+    is_master: { type: 'boolean', description: '是否群主' },
+  },
+  required: ['protocol_id', 'name', 'online', 'is_master'],
+  additionalProperties: false,
+}
+
+const MEMBERS_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean' },
+    group_id: { type: 'string' },
+    name: { type: 'string', description: '群名；网关未给出时为空串' },
+    members: { type: 'array', items: MEMBER_SCHEMA },
+    total: {
+      oneOf: [{ type: 'integer' }, { type: 'null' }],
+      description: '网关给出的成员总数；未返回时为 null',
+    },
+    page: { type: 'integer' },
+    page_size: { type: 'integer' },
+    truncated: { type: 'boolean', description: '是否还有后续页' },
+    error: { type: 'string' },
+    code: {
+      oneOf: [{ type: 'number' }, { type: 'string' }],
+      description: '失败代码：数字为网关错误码，字符串为本地或网关响应检查出的代码',
+    },
+  },
+  required: ['ok'],
+  additionalProperties: false,
+}
+
+interface MemberArgs {
+  groupId: string
+  onlineOnly: boolean
+  page: number
+  pageSize: number
+}
+
+function validateMembersArgs(args: unknown): Validated<MemberArgs> {
+  if (!isRecord(args)) return failure('参数必须是对象：group_id 必填，可选 online_only、page、page_size')
+  const extra = unknownKey(args, MEMBERS_KEYS)
+  if (extra !== undefined) {
+    return failure(`未知参数：${extra}；lanpost_list_group_members 只接受 group_id、online_only、page、page_size`)
+  }
+  const groupId = typeof args.group_id === 'string' ? args.group_id.trim() : ''
+  if (groupId === '') return failure('参数 group_id 必填，且必须是非空字符串')
+  if (args.online_only !== undefined && typeof args.online_only !== 'boolean') {
+    return failure('参数 online_only 必须是布尔值')
+  }
+  const page = args.page === undefined ? 1 : args.page
+  if (typeof page !== 'number' || !Number.isInteger(page) || page < 1) {
+    return failure('参数 page 必须是 ≥1 的整数')
+  }
+  const pageSize = args.page_size === undefined ? LIST_PAGE_SIZE_DEFAULT : args.page_size
+  if (
+    typeof pageSize !== 'number' ||
+    !Number.isInteger(pageSize) ||
+    pageSize < 1 ||
+    pageSize > LIST_PAGE_SIZE_MAX
+  ) {
+    return failure(`参数 page_size 必须是 1–${LIST_PAGE_SIZE_MAX} 的整数`)
+  }
+  return {
+    ok: true,
+    value: { groupId, onlineOnly: args.online_only === true, page, pageSize },
+  }
+}
+
+function projectMember(value: unknown): Record<string, unknown> {
+  const record = isRecord(value) ? value : {}
+  const username = asString(record.username)
+  return {
+    protocol_id: asString(record.protocol_id),
+    name: asString(record.name) || asString(record.display_name) || username,
+    online: record.online === true,
+    is_master: record.is_master === true || record.master === true,
+  }
+}
+
+async function executeMembers(deps: ToolsDeps, args: unknown): Promise<unknown> {
+  const parsed = validateMembersArgs(args)
+  if (!parsed.ok) return parsed
+  const gateway = deps.gateway()
+  if (gateway === undefined) return notConnected()
+  try {
+    const raw = await gateway.listGroupMembers(parsed.value.groupId, {
+      onlineOnly: parsed.value.onlineOnly,
+      page: parsed.value.page,
+      pageSize: parsed.value.pageSize,
+    })
+    if (!isRecord(raw) || !Array.isArray(raw.members)) {
+      return failure('groups.members 返回格式异常：缺少 members 数组', BAD_RESPONSE)
+    }
+    const members = raw.members.slice(0, parsed.value.pageSize).map(projectMember)
+    const total = typeof raw.total === 'number' ? raw.total : null
+    const truncated =
+      total !== null
+        ? parsed.value.page * parsed.value.pageSize < total
+        : members.length >= parsed.value.pageSize
+    return {
+      ok: true,
+      group_id: parsed.value.groupId,
+      name: asString(raw.name),
+      members,
+      total,
+      page: parsed.value.page,
+      page_size: parsed.value.pageSize,
+      truncated,
+    }
+  } catch (error) {
+    if (error instanceof GatewayError) return gatewayFailure(error)
+    throw error
+  }
+}
+
+function renderMembers(args: unknown, value: unknown): Array<{ type: 'text'; text: string }> {
+  if (isRecord(value) && value.ok === false) {
+    const failed = value as unknown as ToolFailure
+    return [
+      {
+        type: 'text',
+        text: `列出群成员失败：${oneLine(failed.error)}\n${codeLabel(failed.code)}${failureHint(failed.code)}`,
+      },
+    ]
+  }
+  const record = isRecord(args) ? args : {}
+  const listed = value as {
+    group_id: string
+    name: string
+    members: Array<Record<string, unknown>>
+    total: number | null
+    page: number
+    page_size: number
+    truncated: boolean
+  }
+  const label = listed.name === '' ? `group_id ${oneLine(listed.group_id)}` : oneLine(listed.name)
+  const range =
+    listed.total === null
+      ? `第 ${listed.page} 页（每页 ${listed.page_size} 条）`
+      : `第 ${listed.page} 页（共 ${listed.total} 个）`
+  if (listed.members.length === 0) {
+    const onlineHint = record.online_only === true ? '当前只查在线成员，可去掉 online_only 再试。' : ''
+    return [{ type: 'text', text: `群 ${label} 没有找到成员。${onlineHint}` }]
+  }
+  const lines = listed.members.map((member) => {
+    const name = oneLine(asString(member.name)) || '（未命名）'
+    const master = member.is_master === true ? ' · 群主' : ''
+    const state = member.online === true ? '在线' : '离线'
+    return `- ${name} · protocol_id: ${oneLine(asString(member.protocol_id))} · ${state}${master}`
+  })
+  const footer = listed.truncated
+    ? `\n可能还有更多；用 page=${listed.page + 1} 继续，或加 online_only 缩小范围。`
+    : ''
+  return [
+    {
+      type: 'text',
+      text: `群 ${label} 成员：本页 ${listed.members.length} 个，${range}\n${lines.join('\n')}${footer}`,
+    },
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// lanpost_recall_message
+
+const RECALL_PARAMETERS: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    message_id: {
+      type: 'string',
+      description: '要撤回的消息 id（形如 im:123；来自发送结果或入站消息来源行）',
+    },
+  },
+  required: ['message_id'],
+  additionalProperties: false,
+}
+
+const RECALL_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean' },
+    message_id: { type: 'string', description: '实际撤回的消息 id' },
+    recalled: { type: 'boolean', description: '网关是否确认撤回' },
+    error: { type: 'string' },
+    code: {
+      oneOf: [{ type: 'number' }, { type: 'string' }],
+      description: '失败代码：数字为网关错误码，字符串为本地或网关响应检查出的代码',
+    },
+  },
+  required: ['ok'],
+  additionalProperties: false,
+}
+
+const MESSAGE_ID_PATTERN = /^im:\d+$/
+
+async function executeRecall(deps: ToolsDeps, args: unknown): Promise<unknown> {
+  if (!isRecord(args)) return failure('参数必须是对象：message_id 必填')
+  const extra = unknownKey(args, ['message_id'])
+  if (extra !== undefined) return failure(`未知参数：${extra}；lanpost_recall_message 只接受 message_id`)
+  const messageId = typeof args.message_id === 'string' ? args.message_id.trim() : ''
+  if (!MESSAGE_ID_PATTERN.test(messageId)) {
+    return failure('参数 message_id 必须形如 im:123（只撤回数字 id）')
+  }
+  const gateway = deps.gateway()
+  if (gateway === undefined) return notConnected()
+  try {
+    const result = await gateway.recallMessage(messageId)
+    return { ok: true, message_id: result.message_id, recalled: result.recalled }
+  } catch (error) {
+    if (error instanceof GatewayError) return gatewayFailure(error)
+    throw error
+  }
+}
+
+function renderRecall(_args: unknown, value: unknown): Array<{ type: 'text'; text: string }> {
+  if (isRecord(value) && value.ok === false) {
+    const failed = value as unknown as ToolFailure
+    return [
+      {
+        type: 'text',
+        text: `撤回消息失败：${oneLine(failed.error)}\n${codeLabel(failed.code)}${failureHint(failed.code)}`,
+      },
+    ]
+  }
+  const recalled = value as { message_id: string; recalled: boolean }
+  return [
+    {
+      type: 'text',
+      text: recalled.recalled
+        ? `已撤回消息 ${oneLine(recalled.message_id)}。`
+        : `网关未确认撤回消息 ${oneLine(recalled.message_id)}；可能已超过撤回时限或对方已读。`,
+    },
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// lanpost_send_image
+
+const IMAGE_KEYS = ['target', 'protocol_id', 'group_id', 'path'] as const
+
+const IMAGE_PARAMETERS: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    target: {
+      type: 'string',
+      enum: ['user', 'group'],
+      description: 'user=私聊（配 protocol_id）；group=群聊（配 group_id）',
+    },
+    protocol_id: { type: 'string', description: '私聊接收人的 protocol_id；target=user 时必填' },
+    group_id: { type: 'string', description: '群会话的 group_id；target=group 时必填' },
+    path: {
+      type: 'string',
+      description: '本机图片路径（png/jpeg/webp/gif，大小不超过 10 MiB）；相对路径按当前工作目录解析',
+    },
+  },
+  required: ['target', 'path'],
+  additionalProperties: false,
+}
+
+const IMAGE_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean', description: '是否成功交给网关发送' },
+    messageId: { type: 'string', description: '网关返回的消息 id' },
+    deliveryStatus: {
+      oneOf: [{ type: 'string' }, { type: 'null' }],
+      description: '网关给出的初始投递状态；未返回时为 null',
+    },
+    attachmentId: { type: 'string', description: '上传后得到的附件 id' },
+    error: { type: 'string' },
+    code: {
+      oneOf: [{ type: 'number' }, { type: 'string' }],
+      description: '失败代码：数字为网关错误码，字符串为本地或网关响应检查出的代码',
+    },
+  },
+  required: ['ok'],
+  additionalProperties: false,
+}
+
+const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+}
+
+interface ImageArgs {
+  target: { kind: 'user'; protocolId: string } | { kind: 'group'; groupId: string }
+  path: string
+  mimeType: string
+  name: string
+}
+
+function validateImageArgs(args: unknown): Validated<ImageArgs> {
+  if (!isRecord(args)) return failure('参数必须是对象：target、path 必填，私聊配 protocol_id、群聊配 group_id')
+  const extra = unknownKey(args, IMAGE_KEYS)
+  if (extra !== undefined) {
+    return failure(`未知参数：${extra}；lanpost_send_image 只接受 target、protocol_id、group_id、path`)
+  }
+  const target = args.target
+  if (target !== 'user' && target !== 'group') {
+    return failure('参数 target 必须是 user 或 group')
+  }
+  const path = typeof args.path === 'string' ? args.path.trim() : ''
+  if (path === '') return failure('参数 path 必填，且必须是非空字符串')
+  const extension = /\.([A-Za-z0-9]+)$/.exec(path)?.[1]?.toLowerCase() ?? ''
+  const mimeType = IMAGE_MIME_BY_EXTENSION[extension]
+  if (mimeType === undefined) {
+    return failure('只支持 png、jpg/jpeg、webp、gif 图片；请换一张或先转换格式')
+  }
+  const protocolId = typeof args.protocol_id === 'string' ? args.protocol_id.trim() : ''
+  const groupId = typeof args.group_id === 'string' ? args.group_id.trim() : ''
+  if (target === 'user') {
+    if (protocolId === '') return failure('target=user（私聊）时必须提供非空的 protocol_id')
+    if (groupId !== '') return failure('target=user（私聊）时不要传 group_id；请用 protocol_id 指定联系人')
+    return {
+      ok: true,
+      value: { target: { kind: 'user', protocolId }, path, mimeType, name: basename(path) },
+    }
+  }
+  if (groupId === '') return failure('target=group（群聊）时必须提供非空的 group_id')
+  if (protocolId !== '') return failure('target=group（群聊）时不要传 protocol_id；请用 group_id 指定群')
+  return {
+    ok: true,
+    value: { target: { kind: 'group', groupId }, path, mimeType, name: basename(path) },
+  }
+}
+
+function basename(path: string): string {
+  const parts = path.split(/[\\/]/)
+  return parts[parts.length - 1] ?? path
+}
+
+async function executeSendImage(deps: ToolsDeps, args: unknown): Promise<unknown> {
+  const parsed = validateImageArgs(args)
+  if (!parsed.ok) return parsed
+  const gateway = deps.gateway()
+  if (gateway === undefined) return notConnected()
+  let data: Buffer
+  try {
+    data = readFileSync(parsed.value.path)
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    return failure(`读取图片失败：${oneLine(reason)}`, INVALID_ARGS)
+  }
+  try {
+    const result = await gateway.sendImage(parsed.value.target, {
+      data,
+      mimeType: parsed.value.mimeType,
+      name: parsed.value.name,
+    })
+    return {
+      ok: true,
+      messageId: result.message_id,
+      deliveryStatus: result.delivery_status ?? null,
+      attachmentId: result.attachment_id,
+    }
+  } catch (error) {
+    if (error instanceof GatewayError) return gatewayFailure(error)
+    throw error
+  }
+}
+
+function renderSendImage(args: unknown, value: unknown): Array<{ type: 'text'; text: string }> {
+  if (isRecord(value) && value.ok === false) {
+    const failed = value as unknown as ToolFailure
+    return [
+      {
+        type: 'text',
+        text: `发送图片失败：${oneLine(failed.error)}\n${codeLabel(failed.code)}${failureHint(failed.code)}`,
+      },
+    ]
+  }
+  const record = isRecord(args) ? args : {}
+  const sent = value as { messageId: string; deliveryStatus: string | null; attachmentId: string }
+  const targetLabel = record.target === 'group' ? '群' : '联系人'
+  const delivery =
+    sent.deliveryStatus === null ? '网关未返回投递状态' : oneLine(sent.deliveryStatus)
+  return [
+    {
+      type: 'text',
+      text: `已发送图片到${targetLabel}（messageId: ${oneLine(sent.messageId) || '（网关未返回消息 id）'}，attachmentId: ${oneLine(sent.attachmentId)}，投递状态：${delivery}）。`,
+    },
+  ]
+}
+
+// ---------------------------------------------------------------------------
 // 工具装配
 
-/** 造出三个 agent 工具；注册由装配层负责（每个工具的 name 唯一）。 */
+/** 造出 agent 工具；注册由装配层负责（每个工具的 name 唯一）。 */
 export function createTools(deps: ToolsDeps): ToolDefinitionLike[] {
   return [
     {
       name: 'lanpost_send_message',
       description:
-        '当用户要求通过 lanpost-im 给某人或某个群发消息时使用。私聊用 target=user 并提供接收人的 protocol_id（可先用 lanpost_list_contacts 查）；群聊用 target=group 并提供 group_id——group_id 不能从 lanpost_list_contacts 获得，只能来自入站群消息的来源行或用户直接提供。content 是消息正文，UTF-8 不超过 16 KiB（16384 字节）。消息直接交给网关发送，不排队也不自动重试；未连接或发送失败时返回 ok=false 与原因。',
+        '当用户要求通过 lanpost-im 给某人或某个群发消息时使用。私聊用 target=user 并提供接收人的 protocol_id（可先用 lanpost_list_contacts 查）；群聊用 target=group 并提供 group_id（可先用 lanpost_list_groups 查，也可来自入站群消息的来源行）。content 是消息正文，UTF-8 不超过 16 KiB（16384 字节）。消息直接交给网关发送，不排队也不自动重试；未连接或发送失败时返回 ok=false 与原因。',
       parameters: SEND_PARAMETERS,
       output: { schema: SEND_OUTPUT_SCHEMA, render: renderSend },
       execute: (args, _exec) => executeSend(deps, args),
@@ -685,6 +1233,38 @@ export function createTools(deps: ToolsDeps): ToolDefinitionLike[] {
       parameters: LIST_PARAMETERS,
       output: { schema: LIST_OUTPUT_SCHEMA, render: renderList },
       execute: (args, _exec) => executeList(deps, args),
+    },
+    {
+      name: 'lanpost_list_groups',
+      description:
+        '列出本机 lanpost-im 账号所在的群（group_id、群名、群主、成员数等），发群消息前用它拿 group_id。只读；网关版本没有 groups.list 时返回错误码 -32601。',
+      parameters: GROUPS_PARAMETERS,
+      output: { schema: GROUPS_OUTPUT_SCHEMA, render: renderGroups },
+      execute: (args, _exec) => executeGroups(deps, args),
+    },
+    {
+      name: 'lanpost_list_group_members',
+      description:
+        '列出某个群的成员（protocol_id、显示名、在线状态、是否群主），需要找群内某人的 protocol_id 时使用。group_id 必填；online_only 只筛在线；page 从 1 开始，page_size 默认 50、上限 200。网关版本没有 groups.members 时返回错误码 -32601。',
+      parameters: MEMBERS_PARAMETERS,
+      output: { schema: MEMBERS_OUTPUT_SCHEMA, render: renderMembers },
+      execute: (args, _exec) => executeMembers(deps, args),
+    },
+    {
+      name: 'lanpost_recall_message',
+      description:
+        '撤回一条 lanpost-im 消息（形如 im:123，来自发送结果或入站消息的来源行）。仅当用户明确要求撤回、或刚发错消息需要收回时使用；撤回是否被网关接受由返回的 recalled 表示。网关版本没有 message.recall 时返回错误码 -32601。',
+      parameters: RECALL_PARAMETERS,
+      output: { schema: RECALL_OUTPUT_SCHEMA, render: renderRecall },
+      execute: (args, _exec) => executeRecall(deps, args),
+    },
+    {
+      name: 'lanpost_send_image',
+      description:
+        '当用户要求通过 lanpost-im 发送本机图片时使用。私聊用 target=user 配 protocol_id，群聊用 target=group 配 group_id；path 是本机图片路径（png/jpeg/webp/gif，不超过 10 MiB），相对路径按当前工作目录解析。插件负责上传并与网关换附件 id，不返回图片内容。',
+      parameters: IMAGE_PARAMETERS,
+      output: { schema: IMAGE_OUTPUT_SCHEMA, render: renderSendImage },
+      execute: (args, _exec) => executeSendImage(deps, args),
     },
     {
       name: 'lanpost_bridge_status',

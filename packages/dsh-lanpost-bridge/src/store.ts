@@ -3,7 +3,15 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { DEFAULT_GATEWAY_ADDRESS, parseGatewayAddress } from './core.ts'
+import {
+  ACK_TEXT_DEFAULT,
+  ACK_TEXT_MAX,
+  DEFAULT_GATEWAY_ADDRESS,
+  IGNORE_PREFIXES_MAX,
+  TURN_TIMEOUT_DEFAULT_SECONDS,
+  isTurnTimeoutSeconds,
+  parseGatewayAddress,
+} from './core.ts'
 
 /** 用户可在设置页调整的字段。 */
 export interface BridgeSettings {
@@ -15,6 +23,16 @@ export interface BridgeSettings {
   sessionMode: 'continue' | 'new'
   showProcess: boolean
   selfProtocolId: string | null
+  /** 收到消息后是否先发一条回执。 */
+  ackEnabled: boolean
+  /** 回执正文；空串在发送时回退到默认文案。 */
+  ackText: string
+  /** 最终回复发出前是否撤回回执。 */
+  recallAck: boolean
+  /** 命中任一前缀的私聊消息直接丢弃（逗号分隔，大小写不敏感）。 */
+  ignorePrefixes: string
+  /** 等待一轮 turn/end 的超时秒数。 */
+  turnTimeoutSeconds: number
 }
 
 /** lanpost 会话键 → DSH 会话。 */
@@ -45,6 +63,11 @@ export const DEFAULTS: BridgeState = {
   sessionMode: 'continue',
   showProcess: false,
   selfProtocolId: null,
+  ackEnabled: true,
+  ackText: ACK_TEXT_DEFAULT,
+  recallAck: true,
+  ignorePrefixes: '',
+  turnTimeoutSeconds: TURN_TIMEOUT_DEFAULT_SECONDS,
   version: 1,
   lastSequence: 0,
   seenEventIds: [],
@@ -88,6 +111,17 @@ function normalizeState(parsed: Record<string, unknown>): BridgeState {
   if (typeof parsed.showProcess === 'boolean') state.showProcess = parsed.showProcess
   if (typeof parsed.selfProtocolId === 'string' || parsed.selfProtocolId === null) {
     state.selfProtocolId = parsed.selfProtocolId
+  }
+  if (typeof parsed.ackEnabled === 'boolean') state.ackEnabled = parsed.ackEnabled
+  if (typeof parsed.ackText === 'string') {
+    state.ackText = parsed.ackText.slice(0, ACK_TEXT_MAX)
+  }
+  if (typeof parsed.recallAck === 'boolean') state.recallAck = parsed.recallAck
+  if (typeof parsed.ignorePrefixes === 'string') {
+    state.ignorePrefixes = parsed.ignorePrefixes.slice(0, IGNORE_PREFIXES_MAX)
+  }
+  if (isTurnTimeoutSeconds(parsed.turnTimeoutSeconds)) {
+    state.turnTimeoutSeconds = parsed.turnTimeoutSeconds
   }
 
   if (parsed.version === 1) state.version = 1
@@ -171,6 +205,11 @@ export function publicSettings(state: BridgeState): PublicSettings {
     sessionMode: state.sessionMode,
     showProcess: state.showProcess,
     selfProtocolId: state.selfProtocolId,
+    ackEnabled: state.ackEnabled,
+    ackText: state.ackText,
+    recallAck: state.recallAck,
+    ignorePrefixes: state.ignorePrefixes,
+    turnTimeoutSeconds: state.turnTimeoutSeconds,
     tokenSet: state.token !== '',
   }
 }
@@ -198,6 +237,17 @@ export function mergeSettings(state: BridgeState, patch: Record<string, unknown>
   if (typeof patch.showProcess === 'boolean') next.showProcess = patch.showProcess
   if (typeof patch.selfProtocolId === 'string' || patch.selfProtocolId === null) {
     next.selfProtocolId = patch.selfProtocolId
+  }
+  if (typeof patch.ackEnabled === 'boolean') next.ackEnabled = patch.ackEnabled
+  if (typeof patch.ackText === 'string') {
+    next.ackText = patch.ackText.slice(0, ACK_TEXT_MAX)
+  }
+  if (typeof patch.recallAck === 'boolean') next.recallAck = patch.recallAck
+  if (typeof patch.ignorePrefixes === 'string') {
+    next.ignorePrefixes = patch.ignorePrefixes.slice(0, IGNORE_PREFIXES_MAX)
+  }
+  if (isTurnTimeoutSeconds(patch.turnTimeoutSeconds)) {
+    next.turnTimeoutSeconds = patch.turnTimeoutSeconds
   }
 
   return next

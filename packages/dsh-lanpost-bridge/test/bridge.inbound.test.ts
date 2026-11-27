@@ -13,12 +13,22 @@ afterEach(() => {
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve))
 
+/** 轮询等待某个条件成立（错误提示是后台发出的，不能假设 handleMessage 返回时已完成）。 */
+async function settle(check: () => boolean, attempts = 200): Promise<void> {
+  for (let i = 0; i < attempts; i += 1) {
+    if (check()) return
+    await tick()
+  }
+  throw new Error('settle: 条件未在预期轮次内成立')
+}
+
 function setup(overrides: any = {}) {
   const state: any = {
     ...DEFAULTS,
     enabled: true,
     seenEventIds: [],
     sessions: {},
+    ackEnabled: overrides.ackEnabled ?? false,
     ...overrides.state,
   }
   const prompts: any[] = []
@@ -310,6 +320,7 @@ test('建会话失败时回原因、不抛', async () => {
     },
   })
   await s.bridge.handleMessage(msg())
+  await settle(() => s.sent.length >= 1)
   assert.equal(s.prompts.length, 0)
   assert.equal(s.sent[0].text, '创建会话失败：workspace missing')
   assert.deepEqual(s.sent[0].target, { kind: 'user', protocolId: 'p1' })
@@ -328,6 +339,7 @@ test('prompt 被拒时回「会话忙或不可用」', async () => {
     },
   })
   await s.bridge.handleMessage(msg())
+  await settle(() => s.sent.length >= 1)
   assert.equal(s.sent[0].text, '会话忙或不可用：agent busy')
 })
 
@@ -361,7 +373,7 @@ test('create 请求：选了工作区才传 workspaceId，未选则空对象', a
   assert.deepEqual(bare.created[0], {})
 })
 
-test('同一会话键的消息串行处理', async () => {
+test('同一会话键的消息不互相阻塞：第一条未接受时第二条也已投递', async () => {
   let release: () => void = () => {}
   const gate = new Promise<void>((resolve) => {
     release = resolve
@@ -381,49 +393,26 @@ test('同一会话键的消息串行处理', async () => {
   })
   const first = s.bridge.handleMessage(msg({ eventId: 'e1', messageId: 'm1', content: { type: 'text', text: '第一条' } }))
   const second = s.bridge.handleMessage(msg({ eventId: 'e2', messageId: 'm2', content: { type: 'text', text: '第二条' } }))
-  await tick()
-  assert.equal(s.prompts.length, 1)
+  await settle(() => s.prompts.length >= 2)
+  assert.match(s.prompts[1].content[0].text, /第二条$/)
+  assert.equal(s.prompts[1].mode, 'queue')
   release()
   await Promise.all([first, second])
-  assert.equal(s.prompts.length, 2)
-  assert.match(s.prompts[1].content[0].text, /第二条$/)
+  assert.equal(s.prompts[0].sessionId, s.prompts[1].sessionId, '同一来源沿用映射会话')
 })
 
-test('队列超过 20 条回排队提示', async () => {
-  let release: () => void = () => {}
-  const gate = new Promise<void>((resolve) => {
-    release = resolve
-  })
-  const s = setup({
-    deps: {
-      sessions: {
-        create: async () => ({ sessionId: 'sess-1' }),
-        prompt: async (req: any) => {
-          s.prompts.push(req)
-          await gate
-          return { accepted: true }
-        },
-        rename: async () => ({}),
-      },
-    },
-  })
-  const tasks = Array.from({ length: 21 }, (_, index) =>
+test('并发 25 条消息全部投递，不再有插件侧排队提示', async () => {
+  const s = setup()
+  const tasks = Array.from({ length: 25 }, (_, index) =>
     s.bridge.handleMessage(msg({ eventId: `e${index}`, messageId: `m${index}`, content: { type: 'text', text: `t${index}` } })),
   )
-  await tick()
-  assert.equal(s.sent.length, 1)
-  assert.equal(s.sent[0].text, '我这边还排着 20 条消息，稍后再发。')
-  assert.equal(s.audits.filter((entry: any) => entry.detail?.action === 'queue-full').length, 1)
-  // 一条事件只给一个结论：被判满队列丢弃的 e20 不应再记 accepted。
-  const fullEventAudits = s.audits.filter((entry: any) => entry.detail?.eventId === 'e20')
-  assert.equal(fullEventAudits.length, 1)
-  assert.equal(fullEventAudits[0].detail.action, 'queue-full')
-  release()
   await Promise.all(tasks)
-  assert.equal(s.prompts.length, 20)
+  assert.equal(s.prompts.length, 25)
+  const accepted = s.audits.filter((entry: any) => entry.detail?.action === 'accepted')
+  assert.equal(accepted.length, 25)
+  assert.equal(s.sent.filter((entry: any) => entry.text.includes('排着')).length, 0)
 })
-
-test('dispose 后未开始的任务不再执行', async () => {
+test('dispose 后在途投递被丢弃：不再发消息，也不回发', async () => {
   let release: () => void = () => {}
   const gate = new Promise<void>((resolve) => {
     release = resolve
@@ -442,14 +431,13 @@ test('dispose 后未开始的任务不再执行', async () => {
     },
   })
   const first = s.bridge.handleMessage(msg({ eventId: 'e1', messageId: 'm1' }))
-  const second = s.bridge.handleMessage(msg({ eventId: 'e2', messageId: 'm2' }))
-  await tick()
+  await settle(() => s.prompts.length >= 1)
   s.bridge.dispose()
   release()
-  await Promise.all([first, second])
-  assert.equal(s.prompts.length, 1)
+  await first
+  await settle(() => s.sent.length > 0, 20).catch(() => {})
+  assert.equal(s.sent.length, 0, 'dispose 后不得再发回执或回复')
 })
-
 test('投递失败只记日志与审计，不抛', () => {
   const s = setup()
   s.bridge.handleDelivery({ messageId: 'm9', status: 'failed', reason: 'peer offline' })
@@ -628,4 +616,42 @@ test('群 id 只在展示面净化，会话键与回复目标用对端原值', a
   // 键与回复目标保留原值：两个只差方括号的群不会撞同一个会话，回复也不会发错群。
   assert.equal(s.state.sessions[`group:${rawGroupId}`].sessionId, 'sess-1')
   assert.deepEqual(s.sent[0].target, { kind: 'group', groupId: rawGroupId })
+})
+
+// ── 忽略前缀（仅私聊） ──────────────────────────────────────────────────────
+
+test('忽略前缀命中的私聊消息静默丢弃：不建会话、不回执、只记审计', async () => {
+  const s = setup({ state: { ignorePrefixes: '#node, ping', ackEnabled: true } })
+  await s.bridge.handleMessage(msg({ content: { type: 'text', text: '#node status' } }))
+  assert.equal(s.prompts.length, 0)
+  assert.equal(s.created.length, 0)
+  assert.equal(s.sent.length, 0)
+  const ignored = s.audits.filter((entry: any) => entry.detail?.action === 'ignored')
+  assert.equal(ignored.length, 1)
+  assert.equal(ignored[0].detail.reason, 'ignore-prefix')
+  assert.equal(ignored[0].detail.messageId, 'm1')
+})
+
+test('忽略前缀大小写不敏感，且只匹配整条消息的开头', async () => {
+  const s = setup({ state: { ignorePrefixes: 'ping' } })
+  await s.bridge.handleMessage(msg({ eventId: 'e1', messageId: 'm1', content: { type: 'text', text: 'PING 一下' } }))
+  assert.equal(s.prompts.length, 0)
+  await s.bridge.handleMessage(msg({ eventId: 'e2', messageId: 'm2', content: { type: 'text', text: '请 ping 我' } }))
+  assert.equal(s.prompts.length, 1)
+})
+
+test('群消息不受忽略前缀影响', async () => {
+  const s = setup({ state: { ignorePrefixes: '#node' } })
+  await s.bridge.handleMessage(
+    msg({
+      eventId: 'e2',
+      messageId: 'm2',
+      conversationId: 'group:g1',
+      conversationType: 'group',
+      groupId: 'g1',
+      content: { type: 'text', text: '/dsh #node 查一下群状态' },
+    }),
+  )
+  assert.equal(s.prompts.length, 1)
+  assert.match(s.prompts[0].content[0].text, /#node 查一下群状态$/)
 })

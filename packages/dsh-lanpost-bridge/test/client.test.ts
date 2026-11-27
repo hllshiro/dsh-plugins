@@ -7,6 +7,8 @@ import type { BridgeStatus } from '../src/client.ts'
 
 const importCalls: string[] = []
 const realFetch = globalThis.fetch
+/** 原生 fetch 基准：每个用例结束后一律还原到它，避免连续换桩时把前一个桩还原回来。 */
+const NATIVE_FETCH = globalThis.fetch
 globalThis.fetch = (async (input: RequestInfo | URL) => {
   importCalls.push(String(input))
   throw new Error('模块加载期间不应发起 fetch')
@@ -34,8 +36,7 @@ function installFetch(
   handler: (url: string, init: RequestInit | undefined) => HandlerResult | Promise<HandlerResult>,
 ): RecordedCall[] {
   const recorded: RecordedCall[] = []
-  const original = globalThis.fetch
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const stub = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     recorded.push({ url, init })
     const result = await handler(url, init)
@@ -46,8 +47,9 @@ function installFetch(
       json: async () => result.body,
     } as unknown as Response
   }) as typeof fetch
+  globalThis.fetch = stub
   t.after(() => {
-    globalThis.fetch = original
+    globalThis.fetch = NATIVE_FETCH
   })
   return recorded
 }
@@ -60,6 +62,11 @@ const SAMPLE_SETTINGS = {
   sessionMode: 'continue' as const,
   showProcess: false,
   selfProtocolId: 'me',
+  ackEnabled: true,
+  ackText: '',
+  recallAck: true,
+  ignorePrefixes: '',
+  turnTimeoutSeconds: 1800,
 }
 
 const BLANK_FORM = {
@@ -70,6 +77,11 @@ const BLANK_FORM = {
   sessionMode: 'new' as const,
   showProcess: true,
   selfProtocolId: '',
+  ackEnabled: false,
+  ackText: '',
+  recallAck: false,
+  ignorePrefixes: '',
+  turnTimeoutSeconds: '1800',
 }
 
 test('fetchSettings：GET /settings 并解包 settings 字段', async (t) => {
@@ -120,6 +132,11 @@ test('fetchSettings：也接受裸 PublicSettings，并为缺失字段补默认�
     sessionMode: 'continue',
     showProcess: false,
     selfProtocolId: null,
+    ackEnabled: true,
+    ackText: '',
+    recallAck: true,
+    ignorePrefixes: '',
+    turnTimeoutSeconds: 1800,
   })
 })
 
@@ -328,6 +345,11 @@ test('toForm：公开设置转表单，令牌永远留空', () => {
       sessionMode: 'continue',
     showProcess: false,
     selfProtocolId: 'me',
+    ackEnabled: true,
+    ackText: '',
+    recallAck: true,
+    ignorePrefixes: '',
+    turnTimeoutSeconds: '1800',
   })
 
   assert.equal(client.toForm({ ...SAMPLE_SETTINGS, workspaceId: null, selfProtocolId: null }).token, '')
@@ -344,6 +366,11 @@ test('toPatch：空令牌不提交，空工作区/路径/身份转 null', () => 
     sessionMode: 'new',
     showProcess: true,
     selfProtocolId: null,
+    ackEnabled: false,
+    ackText: '',
+    recallAck: false,
+    ignorePrefixes: '',
+    turnTimeoutSeconds: 1800,
   })
   assert.equal('token' in patch, false)
 
@@ -365,6 +392,11 @@ test('toPatch：去空白并保留非空令牌', () => {
     sessionMode: 'new',
     showProcess: true,
     selfProtocolId: 'me',
+    ackEnabled: false,
+    ackText: '',
+    recallAck: false,
+    ignorePrefixes: '',
+    turnTimeoutSeconds: 1800,
     token: 'tok-1',
   })
 })
